@@ -1,0 +1,5070 @@
+package eu.siacs.conversations.persistance;
+
+import android.content.ContentValues;
+import android.content.Context;
+import android.database.Cursor;
+import net.zetetic.database.sqlcipher.SQLiteDatabase;
+import net.zetetic.database.sqlcipher.SQLiteDatabaseHook;
+import net.zetetic.database.sqlcipher.SQLiteConnection;
+import android.database.sqlite.SQLiteException;
+import net.zetetic.database.sqlcipher.SQLiteOpenHelper;
+import android.text.TextUtils;
+import android.os.Build;
+import android.os.Environment;
+import android.os.SystemClock;
+import android.util.Base64;
+import android.util.Log;
+
+import androidx.annotation.Nullable;
+
+import de.monocles.chat.WebxdcUpdate;
+import de.monocles.chat.pinnedmessage.PinnedMessage;
+import androidx.preference.PreferenceManager;
+import eu.siacs.conversations.AppSettings;
+import eu.siacs.conversations.xml.Element;
+
+import com.google.common.base.Stopwatch;
+import com.google.common.collect.Multimap;
+import com.google.common.collect.HashMultimap;
+
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.IOException;
+import java.security.cert.CertificateEncodingException;
+import java.security.cert.CertificateException;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Calendar;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Hashtable;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.Set;
+import java.util.TimeZone;
+import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+import io.ipfs.cid.Cid;
+
+import eu.siacs.conversations.Config;
+import eu.siacs.conversations.crypto.axolotl.AxolotlService;
+import eu.siacs.conversations.crypto.axolotl.FingerprintStatus;
+import eu.siacs.conversations.crypto.axolotl.SQLiteAxolotlStore;
+import eu.siacs.conversations.entities.Account;
+import eu.siacs.conversations.entities.Contact;
+import eu.siacs.conversations.entities.Conversation;
+import eu.siacs.conversations.entities.DownloadableFile;
+import eu.siacs.conversations.entities.Message;
+import eu.siacs.conversations.entities.MucOptions;
+import eu.siacs.conversations.entities.PresenceTemplate;
+import eu.siacs.conversations.entities.Roster;
+import eu.siacs.conversations.entities.ServiceDiscoveryResult;
+import eu.siacs.conversations.services.QuickConversationsService;
+import eu.siacs.conversations.services.ShortcutService;
+import eu.siacs.conversations.utils.CryptoHelper;
+import eu.siacs.conversations.utils.FileHelper;
+import eu.siacs.conversations.utils.CursorUtils;
+import eu.siacs.conversations.utils.FtsUtils;
+import eu.siacs.conversations.utils.MimeUtils;
+import eu.siacs.conversations.utils.Resolver;
+
+import eu.siacs.conversations.xmpp.Jid;
+import eu.siacs.conversations.xmpp.mam.MamReference;
+import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.IOException;
+import java.security.cert.CertificateEncodingException;
+import java.security.cert.CertificateException;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
+import org.json.JSONException;
+import org.json.JSONObject;
+import org.jxmpp.jid.parts.Localpart;
+import org.jxmpp.stringprep.XmppStringprepException;
+import org.signal.libsignal.protocol.IdentityKey;
+import org.signal.libsignal.protocol.IdentityKeyPair;
+import org.signal.libsignal.protocol.InvalidKeyException;
+import org.signal.libsignal.protocol.InvalidMessageException;
+import org.signal.libsignal.protocol.SignalProtocolAddress;
+import org.signal.libsignal.protocol.state.KyberPreKeyRecord;
+import org.signal.libsignal.protocol.state.PreKeyRecord;
+import org.signal.libsignal.protocol.state.SessionRecord;
+import org.signal.libsignal.protocol.state.SignedPreKeyRecord;
+
+public class DatabaseBackend extends SQLiteOpenHelper {
+
+    // Hook for all encrypted databases. The key is always a pre-derived raw 256-bit key
+    // formatted as x'<64 hex chars>'. SQLCipher recognises the x'...' prefix and skips all
+    // KDF processing. preKey is a no-op; postKey applies security-hardening PRAGMAs.
+    public static final SQLiteDatabaseHook ARGON2_DATABASE_HOOK = new SQLiteDatabaseHook() {
+        @Override
+        public void preKey(SQLiteConnection connection) {
+            // Raw key x'...' bypasses KDF — no cipher_kdf_algorithm setting needed.
+        }
+
+        @Override
+        public void postKey(SQLiteConnection connection) {
+            connection.executeRaw("PRAGMA cipher_memory_security = ON;", null, null);
+            connection.executeRaw("PRAGMA secure_delete = ON;", null, null);
+        }
+    };
+
+    private static final String DATABASE_NAME = "history";
+    private static final int DATABASE_VERSION = 72;
+    private static final String REKEY_MIGRATION_IN_PROGRESS = "rekey_migration_in_progress";
+
+    private static boolean requiresMessageIndexRebuild = false;
+    private static DatabaseBackend instance = null;
+    private static final String CREATE_CONTATCS_STATEMENT =
+            "create table if not exists "
+                    + Contact.TABLENAME
+                    + "("
+                    + Contact.ACCOUNT
+                    + " TEXT, "
+                    + Contact.SERVERNAME
+                    + " TEXT, "
+                    + Contact.SYSTEMNAME
+                    + " TEXT,"
+                    + Contact.PRESENCE_NAME
+                    + " TEXT,"
+                    + Contact.JID
+                    + " TEXT,"
+                    + Contact.KEYS
+                    + " TEXT,"
+                    + Contact.PHOTOURI
+                    + " TEXT,"
+                    + Contact.OPTIONS
+                    + " NUMBER,"
+                    + Contact.SYSTEMACCOUNT
+                    + " NUMBER, "
+                    + Contact.AVATAR
+                    + " TEXT, "
+                    + Contact.LAST_PRESENCE
+                    + " TEXT, "
+                    + Contact.CALLS_DISABLED +
+                    " boolean DEFAULT 0,"
+                    + Contact.LAST_TIME
+                    + " NUMBER, "
+                    + Contact.RTP_CAPABILITY
+                    + " TEXT,"
+                    + Contact.GROUPS
+                    + " TEXT, FOREIGN KEY("
+                    + Contact.ACCOUNT
+                    + ") REFERENCES "
+                    + Account.TABLENAME
+                    + "("
+                    + Account.UUID
+                    + ") ON DELETE CASCADE, UNIQUE("
+                    + Contact.ACCOUNT
+                    + ", "
+                    + Contact.JID
+                    + ") ON CONFLICT REPLACE);";
+
+    private static final String CREATE_DISCOVERY_RESULTS_STATEMENT =
+            "create table if not exists "
+                    + ServiceDiscoveryResult.TABLENAME
+                    + "("
+                    + ServiceDiscoveryResult.HASH
+                    + " TEXT, "
+                    + ServiceDiscoveryResult.VER
+                    + " TEXT, "
+                    + ServiceDiscoveryResult.RESULT
+                    + " TEXT, "
+                    + "UNIQUE("
+                    + ServiceDiscoveryResult.HASH
+                    + ", "
+                    + ServiceDiscoveryResult.VER
+                    + ") ON CONFLICT REPLACE);";
+
+    private static final String CREATE_PRESENCE_TEMPLATES_STATEMENT =
+            "CREATE TABLE if not exists "
+                    + PresenceTemplate.TABELNAME
+                    + "("
+                    + PresenceTemplate.UUID
+                    + " TEXT, "
+                    + PresenceTemplate.LAST_USED
+                    + " NUMBER,"
+                    + PresenceTemplate.MESSAGE
+                    + " TEXT,"
+                    + PresenceTemplate.STATUS
+                    + " TEXT,"
+                    + "UNIQUE("
+                    + PresenceTemplate.MESSAGE
+                    + ","
+                    + PresenceTemplate.STATUS
+                    + ") ON CONFLICT REPLACE);";
+
+    private static final String CREATE_PREKEYS_STATEMENT =
+            "CREATE TABLE if not exists "
+                    + SQLiteAxolotlStore.PREKEY_TABLENAME
+                    + "("
+                    + SQLiteAxolotlStore.ACCOUNT
+                    + " TEXT,  "
+                    + SQLiteAxolotlStore.ID
+                    + " INTEGER, "
+                    + SQLiteAxolotlStore.KEY
+                    + " TEXT, FOREIGN KEY("
+                    + SQLiteAxolotlStore.ACCOUNT
+                    + ") REFERENCES "
+                    + Account.TABLENAME
+                    + "("
+                    + Account.UUID
+                    + ") ON DELETE CASCADE, "
+                    + "UNIQUE( "
+                    + SQLiteAxolotlStore.ACCOUNT
+                    + ", "
+                    + SQLiteAxolotlStore.ID
+                    + ") ON CONFLICT REPLACE"
+                    + ");";
+
+    private static final String CREATE_SIGNED_PREKEYS_STATEMENT =
+            "CREATE TABLE if not exists "
+                    + SQLiteAxolotlStore.SIGNED_PREKEY_TABLENAME
+                    + "("
+                    + SQLiteAxolotlStore.ACCOUNT
+                    + " TEXT,  "
+                    + SQLiteAxolotlStore.ID
+                    + " INTEGER, "
+                    + SQLiteAxolotlStore.KEY
+                    + " TEXT, FOREIGN KEY("
+                    + SQLiteAxolotlStore.ACCOUNT
+                    + ") REFERENCES "
+                    + Account.TABLENAME
+                    + "("
+                    + Account.UUID
+                    + ") ON DELETE CASCADE, "
+                    + "UNIQUE( "
+                    + SQLiteAxolotlStore.ACCOUNT
+                    + ", "
+                    + SQLiteAxolotlStore.ID
+                    + ") ON CONFLICT REPLACE"
+                    + ");";
+
+    private static final String CREATE_KYBER_PREKEYS_STATEMENT =
+            "CREATE TABLE IF NOT EXISTS "
+                    + SQLiteAxolotlStore.KYBER_PREKEY_TABLENAME
+                    + "("
+                    + SQLiteAxolotlStore.ACCOUNT
+                    + " TEXT, "
+                    + SQLiteAxolotlStore.ID
+                    + " INTEGER, "
+                    + SQLiteAxolotlStore.KEY
+                    + " TEXT, "
+                    + SQLiteAxolotlStore.KYBER_IS_LAST_RESORT
+                    + " INTEGER DEFAULT 0, "
+                    + "FOREIGN KEY("
+                    + SQLiteAxolotlStore.ACCOUNT
+                    + ") REFERENCES "
+                    + Account.TABLENAME
+                    + "("
+                    + Account.UUID
+                    + ") ON DELETE CASCADE, "
+                    + "UNIQUE("
+                    + SQLiteAxolotlStore.ACCOUNT
+                    + ", "
+                    + SQLiteAxolotlStore.ID
+                    + ") ON CONFLICT REPLACE"
+                    + ");";
+
+    private static final String CREATE_KYBER_LAST_RESORT_SESSIONS_STATEMENT =
+            "CREATE TABLE IF NOT EXISTS "
+                    + SQLiteAxolotlStore.KYBER_LAST_RESORT_SESSIONS_TABLENAME
+                    + "("
+                    + SQLiteAxolotlStore.ACCOUNT
+                    + " TEXT, "
+                    + SQLiteAxolotlStore.KEM_PREKEY_ID
+                    + " INTEGER, "
+                    + SQLiteAxolotlStore.SPK_ID
+                    + " INTEGER, "
+                    + SQLiteAxolotlStore.BASE_KEY
+                    + " TEXT, "
+                    + "FOREIGN KEY("
+                    + SQLiteAxolotlStore.ACCOUNT
+                    + ") REFERENCES "
+                    + Account.TABLENAME
+                    + "("
+                    + Account.UUID
+                    + ") ON DELETE CASCADE, "
+                    + "PRIMARY KEY("
+                    + SQLiteAxolotlStore.ACCOUNT
+                    + ", "
+                    + SQLiteAxolotlStore.KEM_PREKEY_ID
+                    + ", "
+                    + SQLiteAxolotlStore.SPK_ID
+                    + ", "
+                    + SQLiteAxolotlStore.BASE_KEY
+                    + ")"
+                    + ");";
+
+    // monocles PQ-OMEMO2 hybrid identity (ML-DSA-87). Created lazily, like the
+    // kyber tables. Holds two kinds of row per account, keyed by "fingerprint":
+    //   - the literal sentinel "self": value = base64 of THIS device's serialized
+    //     ML-DSA-87 key pair (the post-quantum half of our hybrid identity).
+    //   - a peer's classical identity-key fingerprint (hex): value = base64 of the
+    //     peer's pinned ML-DSA-87 public key. Pinned on first contact (TOFU) and
+    //     never allowed to silently change — a different pq_ik for a known ik is an
+    //     identity change and the session is refused (never downgrade).
+    public static final String OMEMO2_PQ_IDENTITIES_TABLE = "omemo2_pq_identities";
+    public static final String OMEMO2_PQ_KEY = "pq_key";
+    private static final String OMEMO2_PQ_OWN_FINGERPRINT = "self";
+    private static final String CREATE_OMEMO2_PQ_IDENTITIES_STATEMENT =
+            "CREATE TABLE IF NOT EXISTS "
+                    + OMEMO2_PQ_IDENTITIES_TABLE
+                    + "("
+                    + SQLiteAxolotlStore.ACCOUNT
+                    + " TEXT, "
+                    + SQLiteAxolotlStore.FINGERPRINT
+                    + " TEXT, "
+                    + OMEMO2_PQ_KEY
+                    + " TEXT, "
+                    + "FOREIGN KEY("
+                    + SQLiteAxolotlStore.ACCOUNT
+                    + ") REFERENCES "
+                    + Account.TABLENAME
+                    + "("
+                    + Account.UUID
+                    + ") ON DELETE CASCADE, "
+                    + "UNIQUE("
+                    + SQLiteAxolotlStore.ACCOUNT
+                    + ", "
+                    + SQLiteAxolotlStore.FINGERPRINT
+                    + ") ON CONFLICT REPLACE"
+                    + ");";
+
+    // Legacy OMEMO v0.3 (XEP-0384 v0.3.x) state. The old-libsignal
+    // (org.whispersystems) stack uses the ORIGINAL sessions/prekeys/signed_prekeys
+    // tables — that is where pre-PQ-upgrade installs already store this data, in
+    // exactly this library's format, so no migration is needed. The new
+    // (org.signal.libsignal) PQ OMEMO2 stack uses the separate omemo2_* tables
+    // instead (see SQLiteAxolotlStore). Identities/trust are shared (per-IK).
+    private static final String CREATE_LEGACY_SESSIONS_STATEMENT =
+            "CREATE TABLE if not exists sessions ("
+                    + SQLiteAxolotlStore.ACCOUNT + " TEXT, "
+                    + SQLiteAxolotlStore.NAME + " TEXT, "
+                    + SQLiteAxolotlStore.DEVICE_ID + " INTEGER, "
+                    + SQLiteAxolotlStore.KEY + " TEXT, "
+                    + "FOREIGN KEY(" + SQLiteAxolotlStore.ACCOUNT + ") REFERENCES "
+                    + Account.TABLENAME + "(" + Account.UUID + ") ON DELETE CASCADE, "
+                    + "UNIQUE(" + SQLiteAxolotlStore.ACCOUNT + ", "
+                    + SQLiteAxolotlStore.NAME + ", "
+                    + SQLiteAxolotlStore.DEVICE_ID
+                    + ") ON CONFLICT REPLACE);";
+
+    private static final String CREATE_LEGACY_PREKEYS_STATEMENT =
+            "CREATE TABLE if not exists prekeys ("
+                    + SQLiteAxolotlStore.ACCOUNT + " TEXT, "
+                    + SQLiteAxolotlStore.ID + " INTEGER, "
+                    + SQLiteAxolotlStore.KEY + " TEXT, "
+                    + "FOREIGN KEY(" + SQLiteAxolotlStore.ACCOUNT + ") REFERENCES "
+                    + Account.TABLENAME + "(" + Account.UUID + ") ON DELETE CASCADE, "
+                    + "UNIQUE(" + SQLiteAxolotlStore.ACCOUNT + ", " + SQLiteAxolotlStore.ID
+                    + ") ON CONFLICT REPLACE);";
+
+    private static final String CREATE_LEGACY_SIGNED_PREKEYS_STATEMENT =
+            "CREATE TABLE if not exists signed_prekeys ("
+                    + SQLiteAxolotlStore.ACCOUNT + " TEXT, "
+                    + SQLiteAxolotlStore.ID + " INTEGER, "
+                    + SQLiteAxolotlStore.KEY + " TEXT, "
+                    + "FOREIGN KEY(" + SQLiteAxolotlStore.ACCOUNT + ") REFERENCES "
+                    + Account.TABLENAME + "(" + Account.UUID + ") ON DELETE CASCADE, "
+                    + "UNIQUE(" + SQLiteAxolotlStore.ACCOUNT + ", " + SQLiteAxolotlStore.ID
+                    + ") ON CONFLICT REPLACE);";
+
+    private static final String CREATE_SESSIONS_STATEMENT =
+            "CREATE TABLE if not exists "
+                    + SQLiteAxolotlStore.SESSION_TABLENAME
+                    + "("
+                    + SQLiteAxolotlStore.ACCOUNT
+                    + " TEXT,  "
+                    + SQLiteAxolotlStore.NAME
+                    + " TEXT, "
+                    + SQLiteAxolotlStore.DEVICE_ID
+                    + " INTEGER, "
+                    + SQLiteAxolotlStore.KEY
+                    + " TEXT, FOREIGN KEY("
+                    + SQLiteAxolotlStore.ACCOUNT
+                    + ") REFERENCES "
+                    + Account.TABLENAME
+                    + "("
+                    + Account.UUID
+                    + ") ON DELETE CASCADE, "
+                    + "UNIQUE( "
+                    + SQLiteAxolotlStore.ACCOUNT
+                    + ", "
+                    + SQLiteAxolotlStore.NAME
+                    + ", "
+                    + SQLiteAxolotlStore.DEVICE_ID
+                    + ") ON CONFLICT REPLACE"
+                    + ");";
+
+    private static final String CREATE_IDENTITIES_STATEMENT =
+            "CREATE TABLE if not exists "
+                    + SQLiteAxolotlStore.IDENTITIES_TABLENAME
+                    + "("
+                    + SQLiteAxolotlStore.ACCOUNT
+                    + " TEXT,  "
+                    + SQLiteAxolotlStore.NAME
+                    + " TEXT, "
+                    + SQLiteAxolotlStore.OWN
+                    + " INTEGER, "
+                    + SQLiteAxolotlStore.FINGERPRINT
+                    + " TEXT, "
+                    + SQLiteAxolotlStore.CERTIFICATE
+                    + " BLOB, "
+                    + SQLiteAxolotlStore.TRUST
+                    + " TEXT, "
+                    + SQLiteAxolotlStore.ACTIVE
+                    + " NUMBER, "
+                    + SQLiteAxolotlStore.LAST_ACTIVATION
+                    + " NUMBER,"
+                    + SQLiteAxolotlStore.KEY
+                    + " TEXT, FOREIGN KEY("
+                    + SQLiteAxolotlStore.ACCOUNT
+                    + ") REFERENCES "
+                    + Account.TABLENAME
+                    + "("
+                    + Account.UUID
+                    + ") ON DELETE CASCADE, "
+                    + "UNIQUE( "
+                    + SQLiteAxolotlStore.ACCOUNT
+                    + ", "
+                    + SQLiteAxolotlStore.NAME
+                    + ", "
+                    + SQLiteAxolotlStore.FINGERPRINT
+                    + ") ON CONFLICT IGNORE"
+                    + ");";
+
+    private static final String RESOLVER_RESULTS_TABLENAME = "resolver_results";
+
+    private static final String CREATE_RESOLVER_RESULTS_TABLE =
+            "create table if not exists "
+                    + RESOLVER_RESULTS_TABLENAME
+                    + "("
+                    + Resolver.Result.DOMAIN
+                    + " TEXT,"
+                    + Resolver.Result.HOSTNAME
+                    + " TEXT,"
+                    + Resolver.Result.IP
+                    + " BLOB,"
+                    + Resolver.Result.PRIORITY
+                    + " NUMBER,"
+                    + Resolver.Result.DIRECT_TLS
+                    + " NUMBER,"
+                    + Resolver.Result.AUTHENTICATED
+                    + " NUMBER,"
+                    + Resolver.Result.PORT
+                    + " NUMBER,"
+                    + "UNIQUE("
+                    + Resolver.Result.DOMAIN
+                    + ") ON CONFLICT REPLACE"
+                    + ");";
+    private static String CREATE_MESSAGE_FILE_DELETED_INDEX = "create index if not exists message_file_deleted_index ON " + Message.TABLENAME + "(" + "file_deleted" + ")";
+    private static final String CREATE_MESSAGE_PARENT_UUID_INDEX =
+            "CREATE INDEX if not exists message_parent_uuid_index ON "
+                    + Message.TABLENAME
+                    + "("
+                    + Message.PARENT_UUID
+                    + ")";
+    private static final String CREATE_MESSAGE_TIME_INDEX =
+            "CREATE INDEX if not exists message_time_index ON "
+                    + Message.TABLENAME
+                    + "("
+                    + Message.TIME_SENT
+                    + ")";
+    private static final String CREATE_MESSAGE_CONVERSATION_INDEX =
+            "CREATE INDEX if not exists message_conversation_index ON "
+                    + Message.TABLENAME
+                    + "("
+                    + Message.CONVERSATION
+                    + ")";
+    private static final String CREATE_MESSAGE_DELETED_INDEX =
+            "CREATE INDEX if not exists message_deleted_index ON "
+                    + Message.TABLENAME
+                    + "("
+                    + Message.DELETED
+                    + ")";
+    private static final String CREATE_MESSAGE_RELATIVE_FILE_PATH_INDEX =
+            "CREATE INDEX if not exists message_file_path_index ON "
+                    + Message.TABLENAME
+                    + "("
+                    + Message.RELATIVE_FILE_PATH
+                    + ")";
+    private static final String CREATE_MESSAGE_TYPE_INDEX =
+            "CREATE INDEX if not exists message_type_index ON " + Message.TABLENAME + "(" + Message.TYPE + ")";
+    private static final String CREATE_MESSAGE_EXPIRE_AT_INDEX =
+            "CREATE INDEX if not exists message_expire_at_index ON "
+                    + Message.TABLENAME
+                    + "("
+                    + Message.EXPIRE_AT
+                    + ")";
+
+    private static final String CREATE_MESSAGE_INDEX_TABLE =
+            "CREATE VIRTUAL TABLE if not exists messages_index USING fts4"
+                    + " (uuid,body,notindexed=\"uuid\",content=\""
+                    + Message.TABLENAME
+                    + "\",tokenize='unicode61')";
+    private static final String CREATE_MESSAGE_INSERT_TRIGGER =
+            "CREATE TRIGGER if not exists after_message_insert AFTER INSERT ON "
+                    + Message.TABLENAME
+                    + " BEGIN INSERT INTO messages_index(rowid,uuid,body)"
+                    + " VALUES(NEW.rowid,NEW.uuid,NEW.body); END;";
+    private static final String CREATE_MESSAGE_UPDATE_TRIGGER =
+            "CREATE TRIGGER if not exists after_message_update UPDATE OF uuid,body ON "
+                    + Message.TABLENAME
+                    + " BEGIN UPDATE messages_index SET body=NEW.body,uuid=NEW.uuid WHERE"
+                    + " rowid=OLD.rowid; END;";
+    private static final String CREATE_MESSAGE_DELETE_TRIGGER =
+            "CREATE TRIGGER if not exists after_message_delete AFTER DELETE ON "
+                    + Message.TABLENAME
+                    + " BEGIN DELETE FROM messages_index WHERE rowid=OLD.rowid; END;";
+    private static final String COPY_PREEXISTING_ENTRIES =
+            "INSERT INTO messages_index(messages_index) VALUES('rebuild');";
+
+    private static final String CREATE_POSTS_TABLE =
+            "CREATE TABLE if not exists " + eu.siacs.conversations.entities.Post.TABLENAME + " ("
+                    + eu.siacs.conversations.entities.Post.UUID + " TEXT PRIMARY KEY,"
+                    + eu.siacs.conversations.entities.Post.ACCOUNT_UUID + " TEXT,"
+                    + eu.siacs.conversations.entities.Post.AUTHOR_JID + " TEXT,"
+                    + eu.siacs.conversations.entities.Post.TITLE + " TEXT,"
+                    + eu.siacs.conversations.entities.Post.CONTENT + " TEXT,"
+                    + eu.siacs.conversations.entities.Post.ATTACHMENT_URL + " TEXT,"
+                    + eu.siacs.conversations.entities.Post.ATTACHMENT_TYPE + " TEXT,"
+                    + eu.siacs.conversations.entities.Post.LINK_URL + " TEXT,"
+                    + eu.siacs.conversations.entities.Post.PUBLISHED + " NUMBER,"
+                    + eu.siacs.conversations.entities.Post.COMMENTS_NODE + " TEXT,"
+                    + "FOREIGN KEY(" + eu.siacs.conversations.entities.Post.ACCOUNT_UUID + ") REFERENCES "
+                    + eu.siacs.conversations.entities.Account.TABLENAME
+                    + "(" + eu.siacs.conversations.entities.Account.UUID + ") ON DELETE CASCADE);";
+
+    private static final String CREATE_STORIES_TABLE =
+            "CREATE TABLE IF NOT EXISTS " + eu.siacs.conversations.entities.Story.TABLENAME + " ("
+                    + eu.siacs.conversations.entities.Story.UUID + " TEXT PRIMARY KEY,"
+                    + eu.siacs.conversations.entities.Story.CONTACT + " TEXT,"
+                    + eu.siacs.conversations.entities.Story.URL + " TEXT,"
+                    + eu.siacs.conversations.entities.Story.TYPE + " TEXT,"
+                    + eu.siacs.conversations.entities.Story.TITLE + " TEXT,"
+                    + eu.siacs.conversations.entities.Story.PUBLISHED + " NUMBER);";
+
+    protected Context context;
+
+    private DatabaseBackend(Context context) {
+        this(context, getKeyBytes(context));
+    }
+
+    private DatabaseBackend(Context context, byte[] keyBytes) {
+        super(context, DATABASE_NAME, keyBytes, null, DATABASE_VERSION, 0, null,
+                ARGON2_DATABASE_HOOK, true);
+        this.context = context;
+    }
+
+    /**
+     * Derives the key bytes that SQLCipher should receive. The DB is always encrypted.
+     *
+     * <ul>
+     *   <li>Argon2id mode (user password): derives via Argon2id + KeyStore HMAC, formats as
+     *       x'&lt;64 hex chars&gt;' so SQLCipher uses it as a raw key (no internal KDF).
+     *   <li>Auto mode (no user password): reads or generates a 32-byte random key from
+     *       hardware-backed DataStore, derives via KeyStore HMAC, formats the same way.
+     * </ul>
+     */
+    static byte[] getKeyBytes(Context context) {
+        final AppSettings appSettings = new AppSettings(context);
+        if (appSettings.isArgon2idKdf()) {
+            final char[] password = appSettings.getDatabasePasswordChars();
+            try {
+                final byte[] salt = appSettings.getArgon2Salt();
+                if (salt == null) {
+                    throw new eu.siacs.conversations.EncryptionException(
+                            "Argon2id KDF active but salt is missing — database cannot be opened",
+                            null,
+                            eu.siacs.conversations.EncryptionException.Reason.KEYSTORE_ERROR);
+                }
+                return eu.siacs.conversations.Argon2KeyDerivation.INSTANCE
+                        .deriveRawKeyBytes(password, salt);
+            } finally {
+                java.util.Arrays.fill(password, '\0');
+            }
+        }
+        // Auto mode: use or generate a hardware-bound random key.
+        final byte[] rawAutoKey = appSettings.getOrCreateAutoKey();
+        try {
+            return eu.siacs.conversations.Argon2KeyDerivation.INSTANCE.deriveAutoRawKeyBytes(rawAutoKey);
+        } finally {
+            java.util.Arrays.fill(rawAutoKey, (byte) 0);
+        }
+    }
+
+    private static ContentValues createFingerprintStatusContentValues(
+            FingerprintStatus.Trust trust, boolean active) {
+        ContentValues values = new ContentValues();
+        values.put(SQLiteAxolotlStore.TRUST, trust.toString());
+        values.put(SQLiteAxolotlStore.ACTIVE, active ? 1 : 0);
+        return values;
+    }
+
+    public static boolean requiresMessageIndexRebuild() {
+        return requiresMessageIndexRebuild;
+    }
+
+    public void rebuildMessagesIndex() {
+        final SQLiteDatabase db = getWritableDatabase();
+        final Stopwatch stopwatch = Stopwatch.createStarted();
+        db.execSQL(COPY_PREEXISTING_ENTRIES);
+        Log.d(Config.LOGTAG, "rebuilt message index in " + stopwatch.stop().toString());
+    }
+
+    public boolean isFtsIndexFragmented() {
+        final SQLiteDatabase db = getReadableDatabase();
+        try (final Cursor c = db.rawQuery("SELECT count(*) FROM messages_index_segdir", null)) {
+            return c.moveToFirst() && c.getInt(0) > 4;
+        }
+    }
+
+    public static synchronized DatabaseBackend getInstance(Context context) {
+        if (instance == null) {
+            System.loadLibrary("sqlcipher");
+            recoverFromInterruptedMigration(context);
+            encryptLegacyPlaintextDatabase(context);
+            instance = new DatabaseBackend(context);
+        }
+        return instance;
+    }
+
+    private static void recoverFromInterruptedMigration(Context context) {
+        if (!PreferenceManager.getDefaultSharedPreferences(context)
+                .getBoolean(REKEY_MIGRATION_IN_PROGRESS, false)) return;
+
+        final File dbFile = context.getDatabasePath(DATABASE_NAME);
+        final File backupFile = context.getDatabasePath(DATABASE_NAME + ".bak");
+        final File tempFile = context.getDatabasePath(DATABASE_NAME + ".tmp");
+
+        Log.w(Config.LOGTAG, "rekey: sentinel set — checking interrupted migration state");
+
+        // State A: no .bak — migration hadn't started or sentinel wasn't cleared after success
+        if (!backupFile.exists()) {
+            Log.w(Config.LOGTAG, "rekey: no backup found, treating as clean");
+            if (tempFile.exists()) tempFile.delete();
+            PreferenceManager.getDefaultSharedPreferences(context)
+                    .edit().remove(REKEY_MIGRATION_IN_PROGRESS).apply();
+            return;
+        }
+
+        // State B: .bak exists but dbFile is missing — killed between step 1 and step 2
+        // Prefs still hold old key (setDatabasePassword hadn't run yet).
+        if (!dbFile.exists()) {
+            Log.w(Config.LOGTAG, "rekey: dbFile missing, restoring backup");
+            if (!backupFile.renameTo(dbFile)) {
+                Log.e(Config.LOGTAG, "rekey: CRITICAL — could not restore backup file");
+            }
+            if (tempFile.exists()) tempFile.delete();
+            PreferenceManager.getDefaultSharedPreferences(context)
+                    .edit().remove(REKEY_MIGRATION_IN_PROGRESS).apply();
+            return;
+        }
+
+        // States C/D: both files exist — test dbFile with the current key (Argon2id or auto).
+        // getKeyBytes() picks the right derivation based on AppSettings.isArgon2idKdf().
+        final byte[] currentKeyBytes;
+        try {
+            currentKeyBytes = getKeyBytes(context);
+        } catch (eu.siacs.conversations.EncryptionException e) {
+            if (e.reason == eu.siacs.conversations.EncryptionException.Reason.NEEDS_SESSION_PASSWORD) {
+                Log.w(Config.LOGTAG, "rekey: session password not available, deferring recovery");
+                return;
+            }
+            Log.e(Config.LOGTAG, "rekey: cannot obtain key for recovery", e);
+            return;
+        }
+
+        boolean dbFileValid = false;
+        try {
+            final SQLiteDatabase test = SQLiteDatabase.openDatabase(
+                    dbFile.getAbsolutePath(),
+                    currentKeyBytes,
+                    null,
+                    SQLiteDatabase.OPEN_READONLY,
+                    ARGON2_DATABASE_HOOK);
+            test.close();
+            dbFileValid = true;
+        } catch (Exception ignored) { /* dbFile not openable with current key */ } finally {
+            if (currentKeyBytes != null) java.util.Arrays.fill(currentKeyBytes, (byte) 0);
+        }
+
+        if (dbFileValid) {
+            // State D: dbFile valid with current key — migration completed; just clean up .bak
+            Log.w(Config.LOGTAG, "rekey: dbFile valid, cleaning up orphaned backup");
+            FileHelper.secureDelete(backupFile);
+            FileHelper.secureDelete(new File(backupFile.getAbsolutePath() + "-wal"));
+            FileHelper.secureDelete(new File(backupFile.getAbsolutePath() + "-shm"));
+        } else {
+            // State C: dbFile has new key but prefs still hold old key (setDatabasePassword
+            // hadn't run yet). Restore .bak to undo the migration; data is recoverable.
+            Log.w(Config.LOGTAG, "rekey: dbFile invalid with current key, restoring backup");
+            FileHelper.secureDelete(dbFile);
+            if (!backupFile.renameTo(dbFile)) {
+                Log.e(Config.LOGTAG, "rekey: CRITICAL — could not restore backup file");
+            }
+        }
+
+        if (tempFile.exists()) tempFile.delete();
+        PreferenceManager.getDefaultSharedPreferences(context)
+                .edit().remove(REKEY_MIGRATION_IN_PROGRESS).apply();
+    }
+
+    /**
+     * Called once on first open after an upgrade from a pre-encryption release.
+     * If the database file has the SQLite plaintext magic header, exports its content
+     * into a fresh SQLCipher-encrypted copy using the same crash-safe rename sequence
+     * as migrate(), then stores the new auto key in DataStore.
+     *
+     * If the process is killed between the file rename and the DataStore write,
+     * recoverFromInterruptedMigration() (which runs first on the next start) will find
+     * the encrypted dbFile unreadable with the current key, restore the plaintext .bak,
+     * and this method will run again on that start — converging safely.
+     */
+    private static void encryptLegacyPlaintextDatabase(Context context) {
+        final File dbFile = context.getDatabasePath(DATABASE_NAME);
+        if (!dbFile.exists() || !looksLikePlainSqlite(dbFile)) return;
+
+        Log.i(Config.LOGTAG, "rekey: plaintext database from pre-encryption release — encrypting");
+
+        final AppSettings settings = new AppSettings(context);
+        final byte[] newAutoKey = eu.siacs.conversations.Argon2KeyDerivation.INSTANCE.generateRandomKey();
+        final byte[] newRawKey = eu.siacs.conversations.Argon2KeyDerivation.INSTANCE.deriveAutoRawKeyBytes(newAutoKey);
+        try {
+            final File tempFile = context.getDatabasePath(DATABASE_NAME + ".tmp");
+            if (tempFile.exists() && !tempFile.delete()) {
+                throw new java.io.IOException("Failed to delete existing temp file");
+            }
+            if (!tempFile.createNewFile()) {
+                throw new java.io.IOException("Failed to create temp file");
+            }
+
+            // Open with null key — SQLCipher accepts plaintext databases this way.
+            final SQLiteDatabase db = SQLiteDatabase.openDatabase(
+                    dbFile.getAbsolutePath(), (byte[]) null, null,
+                    SQLiteDatabase.OPEN_READWRITE | SQLiteDatabase.ENABLE_WRITE_AHEAD_LOGGING,
+                    null);
+            try {
+                final int version = db.getVersion();
+                final String keyStr = new String(newRawKey, java.nio.charset.StandardCharsets.UTF_8);
+                final String attachKeySql = "'" + keyStr.replace("'", "''") + "'";
+                db.rawExecSQL("ATTACH DATABASE "
+                        + android.database.DatabaseUtils.sqlEscapeString(tempFile.getAbsolutePath())
+                        + " AS encrypted KEY " + attachKeySql);
+                db.rawExecSQL("SELECT sqlcipher_export('encrypted');");
+                db.rawExecSQL("PRAGMA encrypted.user_version = " + version);
+                db.rawExecSQL("DETACH DATABASE encrypted;");
+            } finally {
+                db.close();
+            }
+
+            final File backupFile = context.getDatabasePath(DATABASE_NAME + ".bak");
+            if (backupFile.exists()) backupFile.delete();
+
+            PreferenceManager.getDefaultSharedPreferences(context)
+                    .edit().putBoolean(REKEY_MIGRATION_IN_PROGRESS, true).commit();
+
+            boolean prefsUpdated = false;
+            try {
+                if (!dbFile.renameTo(backupFile)) {
+                    throw new java.io.IOException("Failed to rename DB to backup");
+                }
+                if (!tempFile.renameTo(dbFile)) {
+                    if (!backupFile.renameTo(dbFile)) {
+                        Log.e(Config.LOGTAG, "rekey: CRITICAL — could not roll back legacy encryption");
+                    }
+                    throw new java.io.IOException("Failed to rename temp to DB");
+                }
+                // Key written AFTER rename: crash before here leaves .bak (plaintext) recoverable.
+                settings.writeAutoKey(newAutoKey);
+                settings.setAutoKeyMode();
+                prefsUpdated = true;
+                PreferenceManager.getDefaultSharedPreferences(context)
+                        .edit().remove(REKEY_MIGRATION_IN_PROGRESS).commit();
+                FileHelper.secureDelete(backupFile);
+                FileHelper.secureDelete(new File(backupFile.getAbsolutePath() + "-wal"));
+                FileHelper.secureDelete(new File(backupFile.getAbsolutePath() + "-shm"));
+                FileHelper.secureDelete(new File(dbFile.getAbsolutePath() + "-wal"));
+                FileHelper.secureDelete(new File(dbFile.getAbsolutePath() + "-shm"));
+                Log.i(Config.LOGTAG, "rekey: legacy database successfully encrypted");
+            } catch (Exception e) {
+                if (!prefsUpdated) {
+                    PreferenceManager.getDefaultSharedPreferences(context)
+                            .edit().remove(REKEY_MIGRATION_IN_PROGRESS).apply();
+                }
+                throw e;
+            }
+        } catch (Exception e) {
+            Log.e(Config.LOGTAG, "rekey: failed to encrypt legacy plaintext database", e);
+        } finally {
+            java.util.Arrays.fill(newRawKey, (byte) 0);
+            java.util.Arrays.fill(newAutoKey, (byte) 0);
+        }
+    }
+
+    /** True if the file starts with the 16-byte SQLite magic header (i.e. it is not encrypted). */
+    static boolean looksLikePlainSqlite(File file) {
+        // "SQLite format 3\0" — the invariant first 16 bytes of every plain SQLite database.
+        // SQLCipher-encrypted pages have random-looking bytes here instead.
+        final byte[] magic = {
+            0x53,0x51,0x4c,0x69,0x74,0x65,0x20,0x66,
+            0x6f,0x72,0x6d,0x61,0x74,0x20,0x33,0x00
+        };
+        try (java.io.FileInputStream fis = new java.io.FileInputStream(file)) {
+            final byte[] header = new byte[16];
+            return fis.read(header) == 16 && java.util.Arrays.equals(header, magic);
+        } catch (java.io.IOException e) {
+            return false;
+        }
+    }
+
+    public static synchronized void closeInstance() {
+        if (instance != null) {
+            instance.close();
+            instance = null;
+        }
+    }
+
+    @Override
+    public void onConfigure(SQLiteDatabase db) {
+        db.execSQL("PRAGMA foreign_keys=ON");
+    }
+
+    @Override
+    public void onCreate(SQLiteDatabase db) {
+        db.execSQL(
+                "create table if not exists "
+                        + Account.TABLENAME
+                        + "("
+                        + Account.UUID
+                        + " TEXT PRIMARY KEY,"
+                        + Account.USERNAME
+                        + " TEXT,"
+                        + Account.SERVER
+                        + " TEXT,"
+                        + Account.PASSWORD
+                        + " TEXT,"
+                        + Account.DISPLAY_NAME
+                        + " TEXT, "
+                        + Account.STATUS
+                        + " TEXT,"
+                        + Account.STATUS_MESSAGE
+                        + " TEXT,"
+                        + Account.ROSTERVERSION
+                        + " TEXT,"
+                        + Account.OPTIONS
+                        + " NUMBER, "
+                        + Account.AVATAR
+                        + " TEXT, "
+                        + Account.KEYS
+                        + " TEXT, "
+                        + Account.HOSTNAME
+                        + " TEXT, "
+                        + Account.RESOURCE
+                        + " TEXT,"
+                        + Account.PINNED_MECHANISM
+                        + " TEXT,"
+                        + Account.PINNED_CHANNEL_BINDING
+                        + " TEXT,"
+                        + Account.FAST_MECHANISM
+                        + " TEXT,"
+                        + Account.FAST_TOKEN
+                        + " TEXT,"
+                        + Account.ORDERING
+                        + " INTEGER DEFAULT 0,"
+                        + Account.PORT
+                        + " NUMBER DEFAULT 5222)");
+        db.execSQL(
+                "create table if not exists "
+                        + Conversation.TABLENAME
+                        + " ("
+                        + Conversation.UUID
+                        + " TEXT PRIMARY KEY, "
+                        + Conversation.NAME
+                        + " TEXT, "
+                        + Conversation.CONTACT
+                        + " TEXT, "
+                        + Conversation.ACCOUNT
+                        + " TEXT, "
+                        + Conversation.CONTACTJID
+                        + " TEXT, "
+                        + Conversation.CREATED
+                        + " NUMBER, "
+                        + Conversation.STATUS
+                        + " NUMBER, "
+                        + Conversation.MODE
+                        + " NUMBER, "
+                        + Conversation.ATTRIBUTES
+                        + " TEXT, FOREIGN KEY("
+                        + Conversation.ACCOUNT
+                        + ") REFERENCES "
+                        + Account.TABLENAME
+                        + "("
+                        + Account.UUID
+                        + ") ON DELETE CASCADE);");
+        db.execSQL(
+                "create table if not exists "
+                        + Message.TABLENAME
+                        + "( "
+                        + Message.UUID
+                        + " TEXT PRIMARY KEY, "
+                        + Message.CONVERSATION
+                        + " TEXT, "
+                        + Message.TIME_SENT
+                        + " NUMBER, "
+                        + Message.COUNTERPART
+                        + " TEXT, "
+                        + Message.TRUE_COUNTERPART
+                        + " TEXT,"
+                        + Message.BODY
+                        + " TEXT, "
+                        + Message.ENCRYPTION
+                        + " NUMBER, "
+                        + Message.STATUS
+                        + " NUMBER,"
+                        + Message.TYPE
+                        + " NUMBER, "
+                        + Message.RELATIVE_FILE_PATH
+                        + " TEXT, "
+                        + Message.SERVER_MSG_ID
+                        + " TEXT, "
+                        + Message.FINGERPRINT
+                        + " TEXT, "
+                        + Message.CARBON
+                        + " INTEGER, "
+                        + Message.EDITED
+                        + " TEXT, "
+                        + Message.READ
+                        + " NUMBER DEFAULT 1, "
+                        + Message.OOB
+                        + " INTEGER, "
+                        + Message.ERROR_MESSAGE
+                        + " TEXT,"
+                        + Message.READ_BY_MARKERS
+                        + " TEXT,"
+                        + Message.MARKABLE
+                        + " NUMBER DEFAULT 0,"
+                        + "file_deleted"
+                        + " NUMBER DEFAULT 0,"
+                        + Message.DELETED
+                        + " NUMBER DEFAULT 0,"
+                        + Message.BODY_LANGUAGE
+                        + " TEXT,"
+                        + Message.RETRACT_ID
+                        + " TEXT,"
+                        + Message.OCCUPANT_ID
+                        + " TEXT,"
+                        + Message.OCCUPANTID
+                        + " TEXT,"
+                        + Message.REACTIONS
+                        + " TEXT,"
+                        + Message.REMOTE_MSG_ID
+                        + " TEXT,"
+                        + Message.EPHEMERAL_TIMER
+                        + " INTEGER DEFAULT 0,"
+                        + Message.EXPIRE_AT
+                        + " NUMBER DEFAULT 0,"
+                        + Message.PARENT_UUID
+                        + " TEXT, FOREIGN KEY("
+                        + Message.CONVERSATION
+                        + ") REFERENCES "
+                        + Conversation.TABLENAME
+                        + "("
+                        + Conversation.UUID
+                        + ") ON DELETE CASCADE);");
+        db.execSQL(CREATE_MESSAGE_TIME_INDEX);
+        db.execSQL(CREATE_MESSAGE_CONVERSATION_INDEX);
+        db.execSQL(CREATE_MESSAGE_DELETED_INDEX);
+        db.execSQL(CREATE_MESSAGE_FILE_DELETED_INDEX);
+        db.execSQL(CREATE_MESSAGE_RELATIVE_FILE_PATH_INDEX);
+        db.execSQL(CREATE_MESSAGE_TYPE_INDEX);
+        db.execSQL(CREATE_MESSAGE_EXPIRE_AT_INDEX);
+        db.execSQL(CREATE_MESSAGE_PARENT_UUID_INDEX);
+        db.execSQL(CREATE_CONTATCS_STATEMENT);
+        db.execSQL(CREATE_DISCOVERY_RESULTS_STATEMENT);
+        db.execSQL(CREATE_SESSIONS_STATEMENT);
+        db.execSQL(CREATE_PREKEYS_STATEMENT);
+        db.execSQL(CREATE_SIGNED_PREKEYS_STATEMENT);
+        db.execSQL(CREATE_KYBER_PREKEYS_STATEMENT);
+        db.execSQL(CREATE_KYBER_LAST_RESORT_SESSIONS_STATEMENT);
+        db.execSQL(CREATE_LEGACY_SESSIONS_STATEMENT);
+        db.execSQL(CREATE_LEGACY_PREKEYS_STATEMENT);
+        db.execSQL(CREATE_LEGACY_SIGNED_PREKEYS_STATEMENT);
+        db.execSQL(CREATE_IDENTITIES_STATEMENT);
+        db.execSQL(CREATE_PRESENCE_TEMPLATES_STATEMENT);
+        db.execSQL(CREATE_RESOLVER_RESULTS_TABLE);
+        db.execSQL(CREATE_MESSAGE_INDEX_TABLE);
+        db.execSQL(CREATE_MESSAGE_INSERT_TRIGGER);
+        db.execSQL(CREATE_MESSAGE_UPDATE_TRIGGER);
+        db.execSQL(CREATE_MESSAGE_DELETE_TRIGGER);
+        db.execSQL(CREATE_POSTS_TABLE);
+        db.execSQL(CREATE_STORIES_TABLE);
+        monoclesDatabase(db);
+    }
+
+    private void monoclesDatabase(SQLiteDatabase db) {
+        if (!columnExists(db, Message.TABLENAME, "file_deleted")) {
+            try {
+                db.execSQL("ALTER TABLE " + Message.TABLENAME + " ADD COLUMN " + "file_deleted" + " NUMBER DEFAULT 0");
+            } catch (SQLiteException ex) {
+                Log.w("DATABASE BACKEND", "Altering " + Message.TABLENAME + ": " + ex.getMessage());
+            }
+        }
+        db.execSQL(CREATE_MESSAGE_DELETED_INDEX);
+        db.execSQL(CREATE_MESSAGE_FILE_DELETED_INDEX);
+        db.execSQL(CREATE_MESSAGE_RELATIVE_FILE_PATH_INDEX);
+        db.execSQL(CREATE_MESSAGE_TYPE_INDEX);
+
+        if (!columnExists(db, Message.TABLENAME, Message.RETRACT_ID)) {
+            try {
+                db.execSQL("ALTER TABLE " + Message.TABLENAME + " ADD COLUMN " + Message.RETRACT_ID + " TEXT;");
+            } catch (SQLiteException ex) {
+                Log.w("DATABASE BACKEND", "Altering " + Message.TABLENAME + ": " + ex.getMessage());
+            }
+        }
+        if (!columnExists(db, Message.TABLENAME, Message.SUBJECT)) {
+            try {
+                db.execSQL(
+                        "ALTER TABLE " + Message.TABLENAME + " ADD COLUMN " +
+                                Message.SUBJECT + " TEXT"
+                );
+            } catch (SQLiteException ex) {
+                Log.w("DATABASE BACKEND", "Altering " + Message.TABLENAME + ": " + ex.getMessage());
+            }
+        }
+        if (!columnExists(db, Message.TABLENAME, "oobUri")) {
+            try {
+                db.execSQL(
+                    "ALTER TABLE " + Message.TABLENAME + " " +
+                            "ADD COLUMN oobUri TEXT"
+                );
+            } catch (SQLiteException ex) {
+                Log.w("DATABASE BACKEND", "Altering " + Message.TABLENAME + ": " + ex.getMessage());
+            }
+        }
+        if (!columnExists(db, Message.TABLENAME, "fileParams")) {
+            try {
+                db.execSQL(
+                    "ALTER TABLE " + Message.TABLENAME + " " +
+                            "ADD COLUMN fileParams TEXT"
+                );
+            } catch (SQLiteException ex) {
+                Log.w("DATABASE BACKEND", "Altering " + Message.TABLENAME + ": " + ex.getMessage());
+            }
+        }
+        if (!columnExists(db, Message.TABLENAME, "payloads")) {
+            try {
+                db.execSQL(
+                    "ALTER TABLE " + Message.TABLENAME + " " +
+                            "ADD COLUMN payloads TEXT"
+                );
+            } catch (SQLiteException ex) {
+                Log.w("DATABASE BACKEND", "Altering " + Message.TABLENAME + ": " + ex.getMessage());
+            }
+        }
+        db.execSQL(
+                "CREATE TABLE IF NOT EXISTS cids (" +
+                        "cid TEXT NOT NULL PRIMARY KEY," +
+                        "path TEXT NOT NULL" +
+                        ")"
+        );
+        if (!columnExists(db, Message.TABLENAME, "timeReceived")) {
+            try {
+                db.execSQL(
+                    "ALTER TABLE " + Message.TABLENAME + " " +
+                            "ADD COLUMN timeReceived NUMBER"
+                );
+            } catch (SQLiteException ex) {
+                Log.w("DATABASE BACKEND", "Altering " + Message.TABLENAME + ": " + ex.getMessage());
+            }
+        }
+        db.execSQL("CREATE INDEX IF NOT EXISTS message_time_received_index ON " + Message.TABLENAME + " (timeReceived)");
+        db.execSQL(
+                "CREATE TABLE IF NOT EXISTS blocked_media (" +
+                        "cid TEXT NOT NULL PRIMARY KEY" +
+                        ")"
+        );
+        if (!columnExists(db, "cids", "url")) {
+            try {
+                db.execSQL(
+                    "ALTER TABLE cids " +
+                            "ADD COLUMN url TEXT"
+                );
+            } catch (SQLiteException ex) {
+                Log.w("DATABASE BACKEND", "Altering " + Message.TABLENAME + ": " + ex.getMessage());
+            }
+        }
+        db.execSQL(
+                "CREATE TABLE IF NOT EXISTS webxdc_updates (" +
+                        "serial INTEGER PRIMARY KEY AUTOINCREMENT, " +
+                        Message.CONVERSATION + " TEXT NOT NULL, " +
+                        "sender TEXT NOT NULL, " +
+                        "thread TEXT NOT NULL, " +
+                        "threadParent TEXT, " +
+                        "info TEXT, " +
+                        "document TEXT, " +
+                        "summary TEXT, " +
+                        "payload TEXT" +
+                        ")"
+        );
+        db.execSQL("CREATE INDEX IF NOT EXISTS webxdc_index ON webxdc_updates (" + Message.CONVERSATION + ", thread)");
+        if (!columnExists(db, "webxdc_updates", "message_id")) {
+            try {
+                db.execSQL(
+                    "ALTER TABLE webxdc_updates " +
+                            "ADD COLUMN message_id TEXT"
+                );
+            } catch (SQLiteException ex) {
+                Log.w("DATABASE BACKEND", "Altering " + Message.TABLENAME + ": " + ex.getMessage());
+            }
+        }
+        db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS webxdc_message_id_index ON webxdc_updates (" + Message.CONVERSATION + ", message_id)");
+        db.execSQL(
+                "CREATE TABLE IF NOT EXISTS muted_participants (" +
+                        "muc_jid TEXT NOT NULL, " +
+                        "occupant_id TEXT NOT NULL, " +
+                        "nick TEXT NOT NULL," +
+                        "PRIMARY KEY (muc_jid, occupant_id)" +
+                        ")"
+        );
+        if (!columnExists(db, Message.TABLENAME, Message.OCCUPANTID)) {
+            try {
+                db.execSQL(
+                    "ALTER TABLE " + Message.TABLENAME + " " +
+                            "ADD COLUMN occupant_id TEXT"
+                );
+            } catch (SQLiteException ex) {
+                Log.w("DATABASE BACKEND", "Altering " + Message.TABLENAME + ": " + ex.getMessage());
+            }
+        }
+        if (Build.VERSION.SDK_INT >= 34) {
+            if (columnExists(db, "muted_participants", "nick")) {
+                try {
+                    db.execSQL(
+                        "ALTER TABLE muted_participants " +
+                                "DROP COLUMN nick"
+                    );
+                } catch (SQLiteException ex) {
+                    Log.w("DATABASE BACKEND", "Altering " + Message.TABLENAME + ": " + ex.getMessage());
+                }
+            }
+        } else {
+            db.execSQL("DROP TABLE IF EXISTS muted_participants");
+            db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS muted_participants (" +
+                            "muc_jid TEXT NOT NULL, " +
+                            "occupant_id TEXT NOT NULL, " +
+                            "PRIMARY KEY (muc_jid, occupant_id)" +
+                            ")"
+            );
+        }
+        if (!columnExists(db, Message.TABLENAME, Message.NOTIFICATION_DISMISSED)) {
+            try {
+                db.execSQL(
+                    "ALTER TABLE " + Message.TABLENAME + " " +
+                            "ADD COLUMN notificationDismissed NUMBER DEFAULT 0"
+                );
+            } catch (SQLiteException ex) {
+                Log.w("DATABASE BACKEND", "Altering " + Message.TABLENAME + ": " + ex.getMessage());
+            }
+        }
+        db.execSQL(
+                "CREATE TABLE IF NOT EXISTS " + PinnedMessage.TABLENAME + " (" +
+                        PinnedMessage.MESSAGE_UUID + " TEXT PRIMARY KEY, " +
+                        PinnedMessage.CONVERSATION_UUID + " TEXT, " +
+                        PinnedMessage.ACCOUNT_UUID + " TEXT, " +
+                        PinnedMessage.BODY + " TEXT, " +
+                        PinnedMessage.TIMESTAMP + " NUMBER, " +
+                        PinnedMessage.CID + " TEXT, " +
+                        "FOREIGN KEY(" + PinnedMessage.CONVERSATION_UUID + ") REFERENCES " + Conversation.TABLENAME + "(" + Conversation.UUID + ") ON DELETE CASCADE, " +
+                        "FOREIGN KEY(" + PinnedMessage.ACCOUNT_UUID + ") REFERENCES " + Account.TABLENAME + "(" + Account.UUID + ") ON DELETE CASCADE" +
+                        ")"
+        );
+        db.execSQL("CREATE INDEX IF NOT EXISTS pinned_messages_index ON " + PinnedMessage.TABLENAME + " (" + PinnedMessage.CONVERSATION_UUID + ")");
+        db.execSQL("CREATE INDEX IF NOT EXISTS pinned_messages_account_index ON " + PinnedMessage.TABLENAME + " (" + PinnedMessage.ACCOUNT_UUID + ")");
+        db.execSQL(CREATE_KYBER_PREKEYS_STATEMENT);
+        db.execSQL(CREATE_KYBER_LAST_RESORT_SESSIONS_STATEMENT);
+    }
+
+    @Override
+    public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
+        if (oldVersion < 2 && newVersion >= 2) {
+            db.execSQL(
+                    "update "
+                            + Account.TABLENAME
+                            + " set "
+                            + Account.OPTIONS
+                            + " = "
+                            + Account.OPTIONS
+                            + " | 8");
+        }
+        if (oldVersion < 3 && newVersion >= 3) {
+            db.execSQL(
+                    "ALTER TABLE " + Message.TABLENAME + " ADD COLUMN " + Message.TYPE + " NUMBER");
+        }
+        if (oldVersion < 5 && newVersion >= 5) {
+            db.execSQL("DROP TABLE " + Contact.TABLENAME);
+            db.execSQL(CREATE_CONTATCS_STATEMENT);
+            db.execSQL("UPDATE " + Account.TABLENAME + " SET " + Account.ROSTERVERSION + " = NULL");
+        }
+        if (oldVersion < 6 && newVersion >= 6) {
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Message.TABLENAME
+                            + " ADD COLUMN "
+                            + Message.TRUE_COUNTERPART
+                            + " TEXT");
+        }
+        if (oldVersion < 7 && newVersion >= 7) {
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Message.TABLENAME
+                            + " ADD COLUMN "
+                            + Message.REMOTE_MSG_ID
+                            + " TEXT");
+            db.execSQL(
+                    "ALTER TABLE " + Contact.TABLENAME + " ADD COLUMN " + Contact.AVATAR + " TEXT");
+            db.execSQL(
+                    "ALTER TABLE " + Account.TABLENAME + " ADD COLUMN " + Account.AVATAR + " TEXT");
+        }
+        if (oldVersion < 8 && newVersion >= 8) {
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Conversation.TABLENAME
+                            + " ADD COLUMN "
+                            + Conversation.ATTRIBUTES
+                            + " TEXT");
+        }
+        if (oldVersion < 9 && newVersion >= 9) {
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Contact.TABLENAME
+                            + " ADD COLUMN "
+                            + Contact.LAST_TIME
+                            + " NUMBER");
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Contact.TABLENAME
+                            + " ADD COLUMN "
+                            + Contact.LAST_PRESENCE
+                            + " TEXT");
+        }
+        if (oldVersion < 10 && newVersion >= 10) {
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Message.TABLENAME
+                            + " ADD COLUMN "
+                            + Message.RELATIVE_FILE_PATH
+                            + " TEXT");
+        }
+        if (oldVersion < 11 && newVersion >= 11) {
+            db.execSQL(
+                    "ALTER TABLE " + Contact.TABLENAME + " ADD COLUMN " + Contact.GROUPS + " TEXT");
+            db.execSQL("delete from " + Contact.TABLENAME);
+            db.execSQL("update " + Account.TABLENAME + " set " + Account.ROSTERVERSION + " = NULL");
+        }
+        if (oldVersion < 12 && newVersion >= 12) {
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Message.TABLENAME
+                            + " ADD COLUMN "
+                            + Message.SERVER_MSG_ID
+                            + " TEXT");
+        }
+        if (oldVersion < 13 && newVersion >= 13) {
+            db.execSQL("delete from " + Contact.TABLENAME);
+            db.execSQL("update " + Account.TABLENAME + " set " + Account.ROSTERVERSION + " = NULL");
+        }
+        if (oldVersion < 14 && newVersion >= 14) {
+            canonicalizeJids(db);
+        }
+        if (oldVersion < 15 && newVersion >= 15) {
+            recreateAxolotlDb(db);
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Message.TABLENAME
+                            + " ADD COLUMN "
+                            + Message.FINGERPRINT
+                            + " TEXT");
+        }
+        if (oldVersion < 16 && newVersion >= 16) {
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Message.TABLENAME
+                            + " ADD COLUMN "
+                            + Message.CARBON
+                            + " INTEGER");
+        }
+        if (oldVersion < 19 && newVersion >= 19) {
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Account.TABLENAME
+                            + " ADD COLUMN "
+                            + Account.DISPLAY_NAME
+                            + " TEXT");
+        }
+        if (oldVersion < 20 && newVersion >= 20) {
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Account.TABLENAME
+                            + " ADD COLUMN "
+                            + Account.HOSTNAME
+                            + " TEXT");
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Account.TABLENAME
+                            + " ADD COLUMN "
+                            + Account.PORT
+                            + " NUMBER DEFAULT 5222");
+        }
+        if (oldVersion < 26 && newVersion >= 26) {
+            db.execSQL(
+                    "ALTER TABLE " + Account.TABLENAME + " ADD COLUMN " + Account.STATUS + " TEXT");
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Account.TABLENAME
+                            + " ADD COLUMN "
+                            + Account.STATUS_MESSAGE
+                            + " TEXT");
+        }
+        if (oldVersion < 40 && newVersion >= 40) {
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Account.TABLENAME
+                            + " ADD COLUMN "
+                            + Account.RESOURCE
+                            + " TEXT");
+        }
+        /* Any migrations that alter the Account table need to happen BEFORE this migration, as it
+         * depends on account de-serialization.
+         */
+        if (oldVersion < 17 && newVersion >= 17 && newVersion < 31) {
+            List<Account> accounts = getAccounts(db);
+            for (Account account : accounts) {
+                String ownDeviceIdString =
+                        account.getKey(SQLiteAxolotlStore.JSONKEY_REGISTRATION_ID);
+                if (ownDeviceIdString == null) {
+                    continue;
+                }
+                int ownDeviceId = Integer.valueOf(ownDeviceIdString);
+                SignalProtocolAddress ownAddress =
+                        new SignalProtocolAddress(
+                                account.getJid().asBareJid().toString(), ownDeviceId);
+                deleteSession(db, account, ownAddress);
+                IdentityKeyPair identityKeyPair = loadOwnIdentityKeyPair(db, account);
+                if (identityKeyPair != null) {
+                    String[] selectionArgs = {
+                        account.getUuid(),
+                        CryptoHelper.bytesToHex(identityKeyPair.getPublicKey().serialize())
+                    };
+                    ContentValues values = new ContentValues();
+                    values.put(SQLiteAxolotlStore.TRUSTED, 2);
+                    db.update(
+                            SQLiteAxolotlStore.IDENTITIES_TABLENAME,
+                            values,
+                            SQLiteAxolotlStore.ACCOUNT
+                                    + " = ? AND "
+                                    + SQLiteAxolotlStore.FINGERPRINT
+                                    + " = ? ",
+                            selectionArgs);
+                } else {
+                    Log.d(
+                            Config.LOGTAG,
+                            account.getJid().asBareJid()
+                                    + ": could not load own identity key pair");
+                }
+            }
+        }
+        if (oldVersion < 18 && newVersion >= 18) {
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Message.TABLENAME
+                            + " ADD COLUMN "
+                            + Message.READ
+                            + " NUMBER DEFAULT 1");
+        }
+
+        if (oldVersion < 21 && newVersion >= 21) {
+            List<Account> accounts = getAccounts(db);
+            for (Account account : accounts) {
+                account.unsetPgpSignature();
+                db.update(
+                        Account.TABLENAME,
+                        account.getContentValues(),
+                        Account.UUID + "=?",
+                        new String[] {account.getUuid()});
+            }
+        }
+
+        if (oldVersion >= 15 && oldVersion < 22 && newVersion >= 22) {
+            db.execSQL(
+                    "ALTER TABLE "
+                            + SQLiteAxolotlStore.IDENTITIES_TABLENAME
+                            + " ADD COLUMN "
+                            + SQLiteAxolotlStore.CERTIFICATE);
+        }
+
+        if (oldVersion < 23 && newVersion >= 23) {
+            db.execSQL(CREATE_DISCOVERY_RESULTS_STATEMENT);
+        }
+
+        if (oldVersion < 24 && newVersion >= 24) {
+            db.execSQL(
+                    "ALTER TABLE " + Message.TABLENAME + " ADD COLUMN " + Message.EDITED + " TEXT");
+        }
+
+        if (oldVersion < 25 && newVersion >= 25) {
+            db.execSQL(
+                    "ALTER TABLE " + Message.TABLENAME + " ADD COLUMN " + Message.OOB + " INTEGER");
+        }
+
+        if (oldVersion < 26 && newVersion >= 26) {
+            db.execSQL(CREATE_PRESENCE_TEMPLATES_STATEMENT);
+        }
+
+        if (oldVersion < 27 && newVersion >= 27) {
+            db.execSQL("DELETE FROM " + ServiceDiscoveryResult.TABLENAME);
+        }
+
+        if (oldVersion < 28 && newVersion >= 28) {
+            canonicalizeJids(db);
+        }
+
+        if (oldVersion < 29 && newVersion >= 29) {
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Message.TABLENAME
+                            + " ADD COLUMN "
+                            + Message.ERROR_MESSAGE
+                            + " TEXT");
+        }
+        if (oldVersion >= 15 && oldVersion < 31 && newVersion >= 31) {
+            db.execSQL(
+                    "ALTER TABLE "
+                            + SQLiteAxolotlStore.IDENTITIES_TABLENAME
+                            + " ADD COLUMN "
+                            + SQLiteAxolotlStore.TRUST
+                            + " TEXT");
+            db.execSQL(
+                    "ALTER TABLE "
+                            + SQLiteAxolotlStore.IDENTITIES_TABLENAME
+                            + " ADD COLUMN "
+                            + SQLiteAxolotlStore.ACTIVE
+                            + " NUMBER");
+            HashMap<Integer, ContentValues> migration = new HashMap<>();
+            migration.put(
+                    0, createFingerprintStatusContentValues(FingerprintStatus.Trust.TRUSTED, true));
+            migration.put(
+                    1, createFingerprintStatusContentValues(FingerprintStatus.Trust.TRUSTED, true));
+            migration.put(
+                    2,
+                    createFingerprintStatusContentValues(FingerprintStatus.Trust.UNTRUSTED, true));
+            migration.put(
+                    3,
+                    createFingerprintStatusContentValues(
+                            FingerprintStatus.Trust.COMPROMISED, false));
+            migration.put(
+                    4,
+                    createFingerprintStatusContentValues(FingerprintStatus.Trust.TRUSTED, false));
+            migration.put(
+                    5,
+                    createFingerprintStatusContentValues(FingerprintStatus.Trust.TRUSTED, false));
+            migration.put(
+                    6,
+                    createFingerprintStatusContentValues(FingerprintStatus.Trust.UNTRUSTED, false));
+            migration.put(
+                    7,
+                    createFingerprintStatusContentValues(
+                            FingerprintStatus.Trust.VERIFIED_X509, true));
+            migration.put(
+                    8,
+                    createFingerprintStatusContentValues(
+                            FingerprintStatus.Trust.VERIFIED_X509, false));
+            for (Map.Entry<Integer, ContentValues> entry : migration.entrySet()) {
+                String whereClause = SQLiteAxolotlStore.TRUSTED + "=?";
+                String[] where = {String.valueOf(entry.getKey())};
+                db.update(
+                        SQLiteAxolotlStore.IDENTITIES_TABLENAME,
+                        entry.getValue(),
+                        whereClause,
+                        where);
+            }
+        }
+        if (oldVersion >= 15 && oldVersion < 32 && newVersion >= 32) {
+            db.execSQL(
+                    "ALTER TABLE "
+                            + SQLiteAxolotlStore.IDENTITIES_TABLENAME
+                            + " ADD COLUMN "
+                            + SQLiteAxolotlStore.LAST_ACTIVATION
+                            + " NUMBER");
+            ContentValues defaults = new ContentValues();
+            defaults.put(SQLiteAxolotlStore.LAST_ACTIVATION, System.currentTimeMillis());
+            db.update(SQLiteAxolotlStore.IDENTITIES_TABLENAME, defaults, null, null);
+        }
+        if (oldVersion >= 15 && oldVersion < 33 && newVersion >= 33) {
+            String whereClause = SQLiteAxolotlStore.OWN + "=1";
+            db.update(
+                    SQLiteAxolotlStore.IDENTITIES_TABLENAME,
+                    createFingerprintStatusContentValues(FingerprintStatus.Trust.VERIFIED, true),
+                    whereClause,
+                    null);
+        }
+
+        if (oldVersion < 34 && newVersion >= 34) {
+            db.execSQL(CREATE_MESSAGE_TIME_INDEX);
+
+            final File oldPicturesDirectory =
+                    new File(
+                            Environment.getExternalStoragePublicDirectory(
+                                            Environment.DIRECTORY_PICTURES)
+                                    + "/Conversations/");
+            final File oldFilesDirectory =
+                    new File(Environment.getExternalStorageDirectory() + "/Conversations/");
+            final File newFilesDirectory =
+                    new File(
+                            Environment.getExternalStorageDirectory()
+                                    + "/Conversations/Media/Conversations Files/");
+            final File newVideosDirectory =
+                    new File(
+                            Environment.getExternalStorageDirectory()
+                                    + "/Conversations/Media/Conversations Videos/");
+            if (oldPicturesDirectory.exists() && oldPicturesDirectory.isDirectory()) {
+                final File newPicturesDirectory =
+                        new File(
+                                Environment.getExternalStorageDirectory()
+                                        + "/Conversations/Media/Conversations Images/");
+                newPicturesDirectory.getParentFile().mkdirs();
+                if (oldPicturesDirectory.renameTo(newPicturesDirectory)) {
+                    Log.d(
+                            Config.LOGTAG,
+                            "moved "
+                                    + oldPicturesDirectory.getAbsolutePath()
+                                    + " to "
+                                    + newPicturesDirectory.getAbsolutePath());
+                }
+            }
+            if (oldFilesDirectory.exists() && oldFilesDirectory.isDirectory()) {
+                newFilesDirectory.mkdirs();
+                newVideosDirectory.mkdirs();
+                final File[] files = oldFilesDirectory.listFiles();
+                if (files == null) {
+                    return;
+                }
+                for (File file : files) {
+                    if (file.getName().equals(".nomedia")) {
+                        if (file.delete()) {
+                            Log.d(
+                                    Config.LOGTAG,
+                                    "deleted nomedia file in "
+                                            + oldFilesDirectory.getAbsolutePath());
+                        }
+                    } else if (file.isFile()) {
+                        final String name = file.getName();
+                        final int start = name.lastIndexOf('.') + 1;
+                        final boolean isVideo;
+                        if (start < name.length()) {
+                            String mime =
+                                    MimeUtils.guessMimeTypeFromExtension(name.substring(start));
+                            isVideo = mime != null && mime.startsWith("video/");
+                        } else {
+                            isVideo = false;
+                        }
+                        File dst =
+                                new File(
+                                        (isVideo ? newVideosDirectory : newFilesDirectory)
+                                                        .getAbsolutePath()
+                                                + "/"
+                                                + file.getName());
+                        if (file.renameTo(dst)) {
+                            Log.d(Config.LOGTAG, "moved " + file + " to " + dst);
+                        }
+                    }
+                }
+            }
+        }
+        if (oldVersion < 35 && newVersion >= 35) {
+            db.execSQL(CREATE_MESSAGE_CONVERSATION_INDEX);
+        }
+        if (oldVersion < 36 && newVersion >= 36) {
+            List<Account> accounts = getAccounts(db);
+            for (Account account : accounts) {
+                account.setOption(Account.OPTION_REQUIRES_ACCESS_MODE_CHANGE, true);
+                account.setOption(Account.OPTION_LOGGED_IN_SUCCESSFULLY, false);
+                db.update(
+                        Account.TABLENAME,
+                        account.getContentValues(),
+                        Account.UUID + "=?",
+                        new String[] {account.getUuid()});
+            }
+        }
+
+        if (oldVersion < 37 && newVersion >= 37) {
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Message.TABLENAME
+                            + " ADD COLUMN "
+                            + Message.READ_BY_MARKERS
+                            + " TEXT");
+        }
+
+        if (oldVersion < 38 && newVersion >= 38) {
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Message.TABLENAME
+                            + " ADD COLUMN "
+                            + Message.MARKABLE
+                            + " NUMBER DEFAULT 0");
+        }
+
+        if (oldVersion < 39 && newVersion >= 39) {
+            db.execSQL(CREATE_RESOLVER_RESULTS_TABLE);
+        }
+
+        if (QuickConversationsService.isQuicksy() && oldVersion < 43 && newVersion >= 43) {
+            List<Account> accounts = getAccounts(db);
+            for (Account account : accounts) {
+                account.setOption(Account.OPTION_MAGIC_CREATE, true);
+                db.update(
+                        Account.TABLENAME,
+                        account.getContentValues(),
+                        Account.UUID + "=?",
+                        new String[] {account.getUuid()});
+            }
+        }
+
+        if (oldVersion < 44 && newVersion >= 44) {
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Message.TABLENAME
+                            + " ADD COLUMN "
+                            + Message.DELETED
+                            + " NUMBER DEFAULT 0");
+            db.execSQL(CREATE_MESSAGE_DELETED_INDEX);
+            db.execSQL(CREATE_MESSAGE_RELATIVE_FILE_PATH_INDEX);
+            db.execSQL(CREATE_MESSAGE_TYPE_INDEX);
+        }
+
+        if (oldVersion < 45 && newVersion >= 45) {
+            db.execSQL("ALTER TABLE " + Message.TABLENAME + " ADD COLUMN " + Message.BODY_LANGUAGE);
+        }
+
+        if (oldVersion < 46 && newVersion >= 46) {
+            final long start = SystemClock.elapsedRealtime();
+            db.rawQuery("PRAGMA secure_delete = FALSE", null).close();
+            db.execSQL("update " + Message.TABLENAME + " set " + Message.EDITED + "=NULL");
+            db.rawQuery("PRAGMA secure_delete=ON", null).close();
+            final long diff = SystemClock.elapsedRealtime() - start;
+            Log.d(Config.LOGTAG, "deleted old edit information in " + diff + "ms");
+        }
+        if (oldVersion < 47 && newVersion >= 47) {
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Contact.TABLENAME
+                            + " ADD COLUMN "
+                            + Contact.PRESENCE_NAME
+                            + " TEXT");
+        }
+        if (oldVersion < 48 && newVersion >= 48) {
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Contact.TABLENAME
+                            + " ADD COLUMN "
+                            + Contact.RTP_CAPABILITY
+                            + " TEXT");
+        }
+        if (oldVersion < 49 && newVersion >= 49) {
+            db.beginTransaction();
+            db.execSQL("DROP TRIGGER IF EXISTS after_message_insert;");
+            db.execSQL("DROP TRIGGER IF EXISTS after_message_update;");
+            db.execSQL("DROP TRIGGER IF EXISTS after_message_delete;");
+            db.execSQL("DROP TABLE IF EXISTS messages_index;");
+            // a hack that should not be necessary, but
+            // there was at least one occurence when SQLite failed at this
+            db.execSQL("DROP TABLE IF EXISTS messages_index_docsize;");
+            db.execSQL("DROP TABLE IF EXISTS messages_index_segdir;");
+            db.execSQL("DROP TABLE IF EXISTS messages_index_segments;");
+            db.execSQL("DROP TABLE IF EXISTS messages_index_stat;");
+            db.execSQL(CREATE_MESSAGE_INDEX_TABLE);
+            db.execSQL(CREATE_MESSAGE_INSERT_TRIGGER);
+            db.execSQL(CREATE_MESSAGE_UPDATE_TRIGGER);
+            db.execSQL(CREATE_MESSAGE_DELETE_TRIGGER);
+            db.setTransactionSuccessful();
+            db.endTransaction();
+            requiresMessageIndexRebuild = true;
+        }
+        if (oldVersion < 50 && newVersion >= 50) {
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Account.TABLENAME
+                            + " ADD COLUMN "
+                            + Account.PINNED_MECHANISM
+                            + " TEXT");
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Account.TABLENAME
+                            + " ADD COLUMN "
+                            + Account.PINNED_CHANNEL_BINDING
+                            + " TEXT");
+        }
+        if (oldVersion < 51 && newVersion >= 51) {
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Account.TABLENAME
+                            + " ADD COLUMN "
+                            + Account.FAST_MECHANISM
+                            + " TEXT");
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Account.TABLENAME
+                            + " ADD COLUMN "
+                            + Account.FAST_TOKEN
+                            + " TEXT");
+        }
+        if (oldVersion < 60 && newVersion >= 60) {
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Message.TABLENAME
+                            + " ADD COLUMN "
+                            + Message.OCCUPANT_ID
+                            + " TEXT");
+            db.execSQL(
+                    "ALTER TABLE "
+                            + Message.TABLENAME
+                            + " ADD COLUMN "
+                            + Message.REACTIONS
+                            + " TEXT");
+        }
+        if (oldVersion < 61 && newVersion >= 61) {
+            monoclesDatabase(db);
+        }
+        if (oldVersion < 62 && newVersion >= 62) {
+            try (final Cursor cursor =
+                         db.query(
+                                 Account.TABLENAME,
+                                 new String[] {Account.UUID, Account.USERNAME},
+                                 null,
+                                 null,
+                                 null,
+                                 null,
+                                 null)) {
+                while (cursor != null && cursor.moveToNext()) {
+                    final var uuid = cursor.getString(0);
+                    final var username = cursor.getString(1);
+                    final Localpart localpart;
+                    try {
+                        localpart = Localpart.fromUnescaped(username);
+                    } catch (final XmppStringprepException e) {
+                        Log.d(Config.LOGTAG, "unable to parse jid");
+                        continue;
+                    }
+                    final var contentValues = new ContentValues();
+                    contentValues.putNull(Account.ROSTERVERSION);
+                    contentValues.put(Account.USERNAME, localpart.toString());
+                    db.update(
+                            Account.TABLENAME,
+                            contentValues,
+                            Account.UUID + "=?",
+                            new String[] {uuid});
+                }
+            }
+        }
+        if (oldVersion < 63 && newVersion >= 63) {
+            if (!columnExists(db, Message.TABLENAME, Message.RETRACT_ID)) {
+                db.execSQL("ALTER TABLE " + Message.TABLENAME + " ADD COLUMN " + Message.RETRACT_ID + " TEXT;");
+            }
+        }
+        if (oldVersion < 64 && newVersion >= 64) {
+            try {
+                db.execSQL("ALTER TABLE " + Account.TABLENAME + " ADD COLUMN " + Account.ORDERING + " INTEGER DEFAULT 0");
+            } catch (Exception e) {
+                Log.e(Config.LOGTAG, "Failed to add ordering column to account table", e);
+            }
+        }
+        if (oldVersion < 65 && newVersion >= 65) {
+            db.execSQL("ALTER TABLE " + Contact.TABLENAME + " ADD COLUMN " + Contact.CALLS_DISABLED + " boolean DEFAULT 0");
+        }
+        if (oldVersion < 66 && newVersion >= 66) {
+            db.execSQL(CREATE_POSTS_TABLE);
+        }
+        if (oldVersion < 67 && newVersion >= 67) {
+            try {
+                db.execSQL("ALTER TABLE " + eu.siacs.conversations.entities.Post.TABLENAME + " ADD COLUMN " + eu.siacs.conversations.entities.Post.LINK_URL + " TEXT;");
+            } catch (final SQLiteException e) {
+                Log.e(Config.LOGTAG, "unable to add link_url column to posts table", e);
+            }
+        }
+        if (oldVersion < 68 && newVersion >= 68) {
+            db.execSQL("ALTER TABLE " + Message.TABLENAME + " ADD COLUMN " + Message.EPHEMERAL_TIMER + " INTEGER DEFAULT 0");
+            db.execSQL("ALTER TABLE " + Message.TABLENAME + " ADD COLUMN " + Message.EXPIRE_AT + " NUMBER DEFAULT 0");
+            db.execSQL(CREATE_MESSAGE_EXPIRE_AT_INDEX);
+        }
+        if (oldVersion < 69 && newVersion >= 69) {
+            db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS " + PinnedMessage.TABLENAME + " (" +
+                            PinnedMessage.MESSAGE_UUID + " TEXT PRIMARY KEY, " +
+                            PinnedMessage.CONVERSATION_UUID + " TEXT, " +
+                            PinnedMessage.ACCOUNT_UUID + " TEXT, " +
+                            PinnedMessage.BODY + " TEXT, " +
+                            PinnedMessage.TIMESTAMP + " NUMBER, " +
+                            PinnedMessage.CID + " TEXT, " +
+                            "FOREIGN KEY(" + PinnedMessage.CONVERSATION_UUID + ") REFERENCES " + Conversation.TABLENAME + "(" + Conversation.UUID + ") ON DELETE CASCADE, " +
+                            "FOREIGN KEY(" + PinnedMessage.ACCOUNT_UUID + ") REFERENCES " + Account.TABLENAME + "(" + Account.UUID + ") ON DELETE CASCADE" +
+                            ")"
+            );
+            db.execSQL("CREATE INDEX IF NOT EXISTS pinned_messages_index ON " + PinnedMessage.TABLENAME + " (" + PinnedMessage.CONVERSATION_UUID + ")");
+            db.execSQL("CREATE INDEX IF NOT EXISTS pinned_messages_account_index ON " + PinnedMessage.TABLENAME + " (" + PinnedMessage.ACCOUNT_UUID + ")");
+        }
+        if (oldVersion < 70 && newVersion >= 70) {
+            db.execSQL(CREATE_STORIES_TABLE);
+        }
+        if (oldVersion < 71 && newVersion >= 71) {
+            // PQ OMEMO2 upgrade (single step from pre-PQ master).
+            //
+            // The new org.signal.libsignal stack gets its OWN fresh tables
+            // (omemo2_sessions / omemo2_prekeys / omemo2_signed_prekeys + the
+            // kyber tables), so every OMEMO2 session is established freshly with
+            // PQXDH + SPQR — it never inherits a pre-PQ classical session.
+            //
+            // The pre-existing org.whispersystems OMEMO state already living in
+            // the original sessions / prekeys / signed_prekeys tables is left
+            // exactly in place; the optional legacy stack reads those directly
+            // (same library + format), so no data is moved or rebuilt.
+            //
+            // Identities (fingerprints + trust + own identity key) are shared and
+            // untouched, so verification carries over for both stacks.
+            db.execSQL(CREATE_SESSIONS_STATEMENT);        // omemo2_sessions
+            db.execSQL(CREATE_PREKEYS_STATEMENT);         // omemo2_prekeys
+            db.execSQL(CREATE_SIGNED_PREKEYS_STATEMENT);  // omemo2_signed_prekeys
+            db.execSQL(CREATE_KYBER_PREKEYS_STATEMENT);
+            db.execSQL(CREATE_KYBER_LAST_RESORT_SESSIONS_STATEMENT);
+            // Ensure the original (legacy-stack) tables exist for completeness;
+            // no-op for upgrading installs where they already hold data.
+            db.execSQL(CREATE_LEGACY_SESSIONS_STATEMENT);       // sessions
+            db.execSQL(CREATE_LEGACY_PREKEYS_STATEMENT);        // prekeys
+            db.execSQL(CREATE_LEGACY_SIGNED_PREKEYS_STATEMENT); // signed_prekeys
+        }
+        if (oldVersion < 72 && newVersion >= 72) {
+            // XEP-0447: a message can carry several files. Every file keeps its own row
+            // (so download, open, share and deletion keep working per file); the rows for
+            // the 2nd..Nth file point at the first one and are hidden from the message list.
+            db.execSQL(
+                    "ALTER TABLE " + Message.TABLENAME + " ADD COLUMN " + Message.PARENT_UUID + " TEXT");
+            db.execSQL(CREATE_MESSAGE_PARENT_UUID_INDEX);
+        }
+    }
+
+    /**
+     * Ensure the legacy OMEMO tables exist. Mirrors {@link #ensureKyberTablesExist()};
+     * defensive call site for first-run race conditions where the upgrade
+     * transaction has not yet committed.
+     */
+    public void ensureLegacyOmemoTablesExist() {
+        final SQLiteDatabase db = getWritableDatabase();
+        db.execSQL(CREATE_LEGACY_SESSIONS_STATEMENT);
+        db.execSQL(CREATE_LEGACY_PREKEYS_STATEMENT);
+        db.execSQL(CREATE_LEGACY_SIGNED_PREKEYS_STATEMENT);
+    }
+
+    /**
+     * Checks if a specific column exists in the given table.
+     *
+     * @param db        The SQLiteDatabase instance.
+     * @param tableName The name of the table to check.
+     * @param columnName The name of the column to check.
+     * @return true if the column exists, false otherwise.
+     */
+    private boolean columnExists(SQLiteDatabase db, String tableName, String columnName) {
+        Cursor cursor = null;
+        try {
+            // Querying with a limit of 0 is an efficient way to get column metadata
+            cursor = db.query(tableName, null, null, null, null, null, null, "0");
+            if (cursor != null) {
+                return cursor.getColumnIndex(columnName) != -1;
+            }
+        } catch (Exception e) {
+            // Log the exception if necessary
+            Log.e("DBHelper", "Error checking if column exists: " + e.getMessage());
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+        return false;
+    }
+
+    private void canonicalizeJids(SQLiteDatabase db) {
+        // migrate db to new, canonicalized JID domainpart representation
+
+        // Conversation table
+        Cursor cursor = db.rawQuery("select * from " + Conversation.TABLENAME, new String[0]);
+        while (cursor.moveToNext()) {
+            String newJid;
+            try {
+                newJid =
+                        Jid.of(
+                                        cursor.getString(
+                                                cursor.getColumnIndexOrThrow(
+                                                        Conversation.CONTACTJID)))
+                                .toString();
+            } catch (final IllegalArgumentException e) {
+                Log.e(
+                        Config.LOGTAG,
+                        "Failed to migrate Conversation CONTACTJID "
+                                + cursor.getString(
+                                        cursor.getColumnIndexOrThrow(Conversation.CONTACTJID))
+                                + ". Skipping...",
+                        e);
+                continue;
+            }
+
+            final String[] updateArgs = {
+                newJid, cursor.getString(cursor.getColumnIndexOrThrow(Conversation.UUID)),
+            };
+            db.execSQL(
+                    "update "
+                            + Conversation.TABLENAME
+                            + " set "
+                            + Conversation.CONTACTJID
+                            + " = ? "
+                            + " where "
+                            + Conversation.UUID
+                            + " = ?",
+                    updateArgs);
+        }
+        cursor.close();
+
+        // Contact table
+        cursor = db.rawQuery("select * from " + Contact.TABLENAME, new String[0]);
+        while (cursor.moveToNext()) {
+            String newJid;
+            try {
+                newJid =
+                        Jid.of(cursor.getString(cursor.getColumnIndexOrThrow(Contact.JID)))
+                                .toString();
+            } catch (final IllegalArgumentException e) {
+                Log.e(
+                        Config.LOGTAG,
+                        "Failed to migrate Contact JID "
+                                + cursor.getString(cursor.getColumnIndexOrThrow(Contact.JID))
+                                + ":  Skipping...",
+                        e);
+                continue;
+            }
+
+            final String[] updateArgs = {
+                newJid,
+                cursor.getString(cursor.getColumnIndexOrThrow(Contact.ACCOUNT)),
+                cursor.getString(cursor.getColumnIndexOrThrow(Contact.JID)),
+            };
+            db.execSQL(
+                    "update "
+                            + Contact.TABLENAME
+                            + " set "
+                            + Contact.JID
+                            + " = ? "
+                            + " where "
+                            + Contact.ACCOUNT
+                            + " = ? "
+                            + " AND "
+                            + Contact.JID
+                            + " = ?",
+                    updateArgs);
+        }
+        cursor.close();
+
+        // Account table
+        cursor = db.rawQuery("select * from " + Account.TABLENAME, new String[0]);
+        while (cursor.moveToNext()) {
+            String newServer;
+            try {
+                newServer =
+                        Jid.of(
+                                        cursor.getString(
+                                                cursor.getColumnIndexOrThrow(Account.USERNAME)),
+                                        cursor.getString(
+                                                cursor.getColumnIndexOrThrow(Account.SERVER)),
+                                        null)
+                                .getDomain()
+                                .toString();
+            } catch (final IllegalArgumentException e) {
+                Log.e(
+                        Config.LOGTAG,
+                        "Failed to migrate Account SERVER "
+                                + cursor.getString(cursor.getColumnIndexOrThrow(Account.SERVER))
+                                + ". Skipping...",
+                        e);
+                continue;
+            }
+
+            String[] updateArgs = {
+                newServer, cursor.getString(cursor.getColumnIndexOrThrow(Account.UUID)),
+            };
+            db.execSQL(
+                    "update "
+                            + Account.TABLENAME
+                            + " set "
+                            + Account.SERVER
+                            + " = ? "
+                            + " where "
+                            + Account.UUID
+                            + " = ?",
+                    updateArgs);
+        }
+        cursor.close();
+    }
+
+    public DownloadableFile getFileForCid(Cid cid) {
+        if (cid == null) return null;
+
+        SQLiteDatabase db = this.getReadableDatabase();
+        Cursor cursor = db.query("cids", new String[]{"path"}, "cid=?", new String[]{cid.toString()}, null, null, null);
+        DownloadableFile f = null;
+        if (cursor.moveToNext()) {
+            f = new DownloadableFile(cursor.getString(0));
+        }
+        cursor.close();
+        return f;
+    }
+
+    public String getUrlForCid(Cid cid) {
+        SQLiteDatabase db = this.getReadableDatabase();
+        Cursor cursor = db.query("cids", new String[]{"url"}, "cid=?", new String[]{cid.toString()}, null, null, null);
+        String url = null;
+        if (cursor.moveToNext()) {
+            url = cursor.getString(0);
+        }
+        cursor.close();
+        return url;
+    }
+
+    public void saveCid(Cid cid, File file) {
+        saveCid(cid, file, null);
+    }
+
+    public void saveCid(Cid cid, File file, String url) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        ContentValues cv = new ContentValues();
+        cv.put("cid", cid.toString());
+        if (file != null) cv.put("path", file.getAbsolutePath());
+        if (url != null) cv.put("url", url);
+        if (db.update("cids", cv, "cid=?", new String[]{cid.toString()}) < 1) {
+            db.insertWithOnConflict("cids", null, cv, SQLiteDatabase.CONFLICT_REPLACE);
+        }
+    }
+
+    public void blockMedia(Cid cid) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        ContentValues cv = new ContentValues();
+        cv.put("cid", cid.toString());
+        db.insertWithOnConflict("blocked_media", null, cv, SQLiteDatabase.CONFLICT_REPLACE);
+    }
+
+    public boolean isBlockedMedia(Cid cid) {
+        SQLiteDatabase db = this.getReadableDatabase();
+        Cursor cursor = db.query("blocked_media", new String[]{"count(*)"}, "cid=?", new String[]{cid.toString()}, null, null, null);
+        boolean is = false;
+        if (cursor.moveToNext()) {
+            is = cursor.getInt(0) > 0;
+        }
+        cursor.close();
+        return is;
+    }
+
+    public void clearBlockedMedia() {
+        SQLiteDatabase db = this.getWritableDatabase();
+        db.execSQL("DELETE FROM blocked_media");
+    }
+
+    public Multimap<String, String> loadMutedMucUsers() {
+        Multimap<String, String> result = HashMultimap.create();
+        SQLiteDatabase db = this.getReadableDatabase();
+        Cursor cursor = db.query("muted_participants", new String[]{"muc_jid", "occupant_id"}, null, null, null, null, null);
+        while (cursor.moveToNext()) {
+            result.put(cursor.getString(0), cursor.getString(1));
+        }
+        cursor.close();
+        return result;
+    }
+
+    public boolean muteMucUser(MucOptions.User user) {
+        if (user.getMuc() == null || user.getOccupantId() == null) return false;
+
+        SQLiteDatabase db = this.getWritableDatabase();
+        ContentValues cv = new ContentValues();
+        cv.put("muc_jid", user.getMuc().toString());
+        cv.put("occupant_id", user.getOccupantId());
+        db.insertWithOnConflict("muted_participants", null, cv, SQLiteDatabase.CONFLICT_REPLACE);
+
+        return true;
+    }
+
+    public boolean unmuteMucUser(MucOptions.User user) {
+        if (user.getMuc() == null || user.getOccupantId() == null) return false;
+
+        SQLiteDatabase db = this.getWritableDatabase();
+        String where = "muc_jid=? AND occupant_id=?";
+        String[] whereArgs = {user.getMuc().toString(), user.getOccupantId()};
+        db.delete("muted_participants", where, whereArgs);
+
+        return true;
+    }
+
+    public void insertWebxdcUpdate(final WebxdcUpdate update) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        db.insertWithOnConflict("webxdc_updates", null, update.getContentValues(), SQLiteDatabase.CONFLICT_IGNORE);
+    }
+
+    public WebxdcUpdate findLastWebxdcUpdate(Message message) {
+        if (message.getThread() == null) {
+            Log.w(Config.LOGTAG, "WebXDC message with no thread!");
+            return null;
+        }
+
+        SQLiteDatabase db = this.getReadableDatabase();
+        String[] selectionArgs = {message.getConversation().getUuid(), message.getThread().getContent()};
+        Cursor cursor = db.query("webxdc_updates", null,
+                Message.CONVERSATION + "=? AND thread=?",
+                selectionArgs, null, null, "serial ASC");
+        WebxdcUpdate update = null;
+        if (cursor.moveToLast()) {
+            update = new WebxdcUpdate(cursor, cursor.getLong(cursor.getColumnIndex("serial")));
+        }
+        cursor.close();
+        return update;
+    }
+
+    public List<WebxdcUpdate> findWebxdcUpdates(Message message, long serial) {
+        SQLiteDatabase db = this.getReadableDatabase();
+        String[] selectionArgs = {message.getConversation().getUuid(), message.getThread().getContent(), String.valueOf(serial)};
+        Cursor cursor = db.query("webxdc_updates", null,
+                Message.CONVERSATION + "=? AND thread=? AND serial>?",
+                selectionArgs, null, null, "serial ASC");
+        long maxSerial = 0;
+        if (cursor.moveToLast()) {
+            maxSerial = cursor.getLong(cursor.getColumnIndex("serial"));
+        }
+        cursor.moveToFirst();
+        cursor.moveToPrevious();
+
+        List<WebxdcUpdate> updates = new ArrayList<>();
+        while (cursor.moveToNext()) {
+            updates.add(new WebxdcUpdate(cursor, maxSerial));
+        }
+        cursor.close();
+        return updates;
+    }
+
+    public void createConversation(Conversation conversation) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        db.insert(Conversation.TABLENAME, null, conversation.getContentValues());
+    }
+
+    public void createMessage(Message message) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        db.insert(Message.TABLENAME, null, message.getContentValues());
+    }
+
+    public void createAccount(Account account) {
+        final var db = this.getWritableDatabase();
+        final ContentValues values = account.getContentValues();
+        db.insert(Account.TABLENAME, null, values);
+    }
+
+    public void insertDiscoveryResult(ServiceDiscoveryResult result) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        db.insert(ServiceDiscoveryResult.TABLENAME, null, result.getContentValues());
+    }
+
+    public ServiceDiscoveryResult findDiscoveryResult(final String hash, final String ver) {
+        SQLiteDatabase db = this.getReadableDatabase();
+        String[] selectionArgs = {hash, ver};
+        Cursor cursor =
+                db.query(
+                        ServiceDiscoveryResult.TABLENAME,
+                        null,
+                        ServiceDiscoveryResult.HASH + "=? AND " + ServiceDiscoveryResult.VER + "=?",
+                        selectionArgs,
+                        null,
+                        null,
+                        null);
+        if (cursor.getCount() == 0) {
+            cursor.close();
+            return null;
+        }
+        cursor.moveToFirst();
+
+        ServiceDiscoveryResult result = null;
+        try {
+            result = new ServiceDiscoveryResult(cursor);
+        } catch (JSONException e) {
+            /* result is still null */
+        }
+
+        cursor.close();
+        return result;
+    }
+
+    public void saveResolverResult(String domain, Resolver.Result result) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        ContentValues contentValues = result.toContentValues();
+        contentValues.put(Resolver.Result.DOMAIN, domain);
+        db.insert(RESOLVER_RESULTS_TABLENAME, null, contentValues);
+    }
+
+    public synchronized Resolver.Result findResolverResult(String domain) {
+        SQLiteDatabase db = this.getReadableDatabase();
+        String where = Resolver.Result.DOMAIN + "=?";
+        String[] whereArgs = {domain};
+        final Cursor cursor =
+                db.query(RESOLVER_RESULTS_TABLENAME, null, where, whereArgs, null, null, null);
+        Resolver.Result result = null;
+        if (cursor != null) {
+            try {
+                if (cursor.moveToFirst()) {
+                    result = Resolver.Result.fromCursor(cursor);
+                }
+            } catch (Exception e) {
+                Log.d(
+                        Config.LOGTAG,
+                        "unable to find cached resolver result in database " + e.getMessage());
+                return null;
+            } finally {
+                cursor.close();
+            }
+        }
+        return result;
+    }
+
+    public void insertPresenceTemplate(PresenceTemplate template) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        String whereToDelete = PresenceTemplate.MESSAGE + "=?";
+        String[] whereToDeleteArgs = {template.getStatusMessage()};
+        db.delete(PresenceTemplate.TABELNAME, whereToDelete, whereToDeleteArgs);
+        db.delete(
+                PresenceTemplate.TABELNAME,
+                PresenceTemplate.UUID
+                        + " not in (select "
+                        + PresenceTemplate.UUID
+                        + " from "
+                        + PresenceTemplate.TABELNAME
+                        + " order by "
+                        + PresenceTemplate.LAST_USED
+                        + " desc limit 9)",
+                null);
+        db.insert(PresenceTemplate.TABELNAME, null, template.getContentValues());
+    }
+
+    public List<PresenceTemplate> getPresenceTemplates() {
+        ArrayList<PresenceTemplate> templates = new ArrayList<>();
+        SQLiteDatabase db = this.getReadableDatabase();
+        Cursor cursor =
+                db.query(
+                        PresenceTemplate.TABELNAME,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        PresenceTemplate.LAST_USED + " desc");
+        while (cursor.moveToNext()) {
+            templates.add(PresenceTemplate.fromCursor(cursor));
+        }
+        cursor.close();
+        return templates;
+    }
+
+    public CopyOnWriteArrayList<Conversation> getConversations(int status) {
+        CopyOnWriteArrayList<Conversation> list = new CopyOnWriteArrayList<>();
+        SQLiteDatabase db = this.getReadableDatabase();
+        String[] selectionArgs = {Integer.toString(status)};
+        Cursor cursor =
+                db.rawQuery(
+                        "select * from "
+                                + Conversation.TABLENAME
+                                + " where "
+                                + Conversation.STATUS
+                                + " = ? and "
+                                + Conversation.CONTACTJID
+                                + " is not null order by "
+                                + Conversation.CREATED
+                                + " desc",
+                        selectionArgs);
+        while (cursor.moveToNext()) {
+            final Conversation conversation = Conversation.fromCursor(cursor);
+            if (conversation.getJid() instanceof Jid.Invalid) {
+                continue;
+            }
+            list.add(conversation);
+        }
+        cursor.close();
+        return list;
+    }
+
+    public Message getMessage(Conversation conversation, String uuid) {
+        ArrayList<Message> list = new ArrayList<>();
+        SQLiteDatabase db = this.getReadableDatabase();
+        Cursor cursor;
+        cursor = db.rawQuery(
+                "SELECT * FROM " + Message.TABLENAME + " " +
+                        "WHERE " + Message.UUID + "=?",
+                new String[]{uuid}
+        );
+        while (cursor.moveToNext()) {
+            try {
+                return Message.fromCursor(cursor, conversation);
+            } catch (Exception e) {
+                Log.e(Config.LOGTAG, "unable to restore message");
+            }
+        }
+        cursor.close();
+        return null;
+    }
+
+    public ArrayList<Message> getMessages(Conversation conversations, int limit) {
+        return getMessages(conversations, limit, -1, false);
+    }
+
+
+    @Nullable
+    public ArrayList<Message> getMessagesNearUuid(Conversation conversation, int limit, String uuid) {
+        final SQLiteDatabase db = this.getReadableDatabase();
+        final String query = "WITH anchor AS (SELECT " + Message.TIME_SENT + ", " + Message.UUID + " FROM " + Message.TABLENAME
+                + " WHERE " + Message.CONVERSATION + "=? AND (" + Message.SERVER_MSG_ID + "=? OR " + Message.REMOTE_MSG_ID + "=? OR " + Message.UUID + "=?)"
+                + " ORDER BY " + Message.TIME_SENT + " DESC LIMIT 1) "
+                + "SELECT * FROM ( "
+                + "  SELECT m.* FROM " + Message.TABLENAME + " m, anchor a "
+                + "  WHERE m." + Message.CONVERSATION + "=? AND (m." + Message.TIME_SENT + " < a." + Message.TIME_SENT + " OR (m." + Message.TIME_SENT + " = a." + Message.TIME_SENT + " AND m." + Message.UUID + " < a." + Message.UUID + ")) "
+                + "  ORDER BY m." + Message.TIME_SENT + " DESC, m." + Message.UUID + " DESC LIMIT ? "
+                + ") "
+                + "UNION ALL "
+                + "SELECT m.* FROM " + Message.TABLENAME + " m, anchor a WHERE m." + Message.UUID + " = a." + Message.UUID + " "
+                + "UNION ALL "
+                + "SELECT * FROM ( "
+                + "  SELECT m.* FROM " + Message.TABLENAME + " m, anchor a "
+                + "  WHERE m." + Message.CONVERSATION + "=? AND (m." + Message.TIME_SENT + " > a." + Message.TIME_SENT + " OR (m." + Message.TIME_SENT + " = a." + Message.TIME_SENT + " AND m." + Message.UUID + " > a." + Message.UUID + ")) "
+                + "  ORDER BY m." + Message.TIME_SENT + " ASC, m." + Message.UUID + " ASC LIMIT ? "
+                + ") "
+                + "ORDER BY " + Message.TIME_SENT + " ASC, " + Message.UUID + " ASC";
+
+        final String[] selectionArgs = {
+                conversation.getUuid(), uuid, uuid, uuid,
+                conversation.getUuid(), String.valueOf(limit / 2),
+                conversation.getUuid(), String.valueOf(limit / 2)
+        };
+
+        final Cursor cursor = db.rawQuery(query, selectionArgs);
+        CursorUtils.upgradeCursorWindowSize(cursor);
+        final ArrayList<Message> list = new ArrayList<>();
+        final Multimap<String, Message> waitingForReplies = HashMultimap.create();
+        final var replyIds = new HashSet<String>();
+        boolean foundAnchor = false;
+        while (cursor.moveToNext()) {
+            try {
+                final Message m = Message.fromCursor(cursor, conversation);
+                if (uuid.equals(m.getServerMsgId()) || uuid.equals(m.getRemoteMsgId()) || uuid.equals(m.getUuid())) {
+                    foundAnchor = true;
+                }
+                final Element reply = m.getReply();
+                if (reply != null && reply.getAttribute("id") != null) {
+                    replyIds.add(reply.getAttribute("id"));
+                    waitingForReplies.put(reply.getAttribute("id"), m);
+                }
+                list.add(m);
+            } catch (Exception e) {
+                Log.e(Config.LOGTAG, "unable to restore message", e);
+            }
+        }
+        cursor.close();
+
+        if (!foundAnchor) {
+            return null;
+        }
+
+        for (final var parent : getMessageFuzzyIds(conversation, replyIds).entrySet()) {
+            for (final var m : waitingForReplies.get(parent.getKey())) {
+                m.setInReplyTo(parent.getValue());
+            }
+        }
+        attachChildMessages(conversation, list);
+
+        return list;
+    }
+
+
+
+    public Map<String, Message> getMessageFuzzyIds(Conversation conversation, Collection<String> ids) {
+        final var result = new Hashtable<String, Message>();
+        if (ids.size() < 1) return result;
+        final ArrayList<String> params = new ArrayList<>();
+        final ArrayList<String> template = new ArrayList<>();
+        for (final var id : ids) {
+            template.add("?");
+        }
+        params.addAll(ids);
+        params.addAll(ids);
+        params.addAll(ids);
+        ArrayList<Message> list = new ArrayList<>();
+        SQLiteDatabase db = this.getReadableDatabase();
+        Cursor cursor;
+        cursor = db.rawQuery(
+                "SELECT * FROM " + Message.TABLENAME + " " +
+                        "WHERE " + Message.UUID + " IN (" + TextUtils.join(",", template) + ") OR " + Message.SERVER_MSG_ID + " IN (" + TextUtils.join(",", template) + ") OR " + Message.REMOTE_MSG_ID + " IN (" + TextUtils.join(",", template) + ")",
+                params.toArray(new String[0])
+        );
+
+        while (cursor.moveToNext()) {
+            try {
+                final var m = Message.fromCursor(cursor, conversation);
+                if (ids.contains(m.getUuid())) result.put(m.getUuid(), m);
+                if (ids.contains(m.getServerMsgId())) result.put(m.getServerMsgId(), m);
+                if (ids.contains(m.getRemoteMsgId())) result.put(m.getRemoteMsgId(), m);
+            } catch (Exception e) {
+                Log.e(Config.LOGTAG, "unable to restore message");
+            }
+        }
+        cursor.close();
+        return result;
+    }
+
+    public ArrayList<Message> getMessages(Conversation conversation, int limit, long timestamp, String uuid, boolean isForward) {
+        ArrayList<Message> list = new ArrayList<>();
+        SQLiteDatabase db = this.getReadableDatabase();
+        Cursor cursor;
+        String comparsionOperation = isForward ? ">" : "<";
+        String sorting = isForward ? " ASC " : " DESC ";
+        if (timestamp == -1) {
+            String[] selectionArgs = {conversation.getUuid()};
+            cursor = db.rawQuery(
+                    "SELECT * FROM " + Message.TABLENAME + " " +
+                            "WHERE " + Message.UUID + " IN (" +
+                            "SELECT " + Message.UUID + " FROM " + Message.TABLENAME +
+                            " WHERE " + Message.CONVERSATION + "=? AND " + Message.PARENT_UUID + " IS NULL " +
+                            "ORDER BY " + Message.TIME_SENT + sorting + "," + Message.UUID + sorting +
+                            "LIMIT " + String.valueOf(limit) + ") " +
+                            "ORDER BY " + Message.TIME_SENT + sorting + "," + Message.UUID + sorting,
+                    selectionArgs
+            );
+        } else {
+            String[] selectionArgs = {conversation.getUuid(),
+                    Long.toString(timestamp), uuid, Long.toString(timestamp)};
+            cursor = db.rawQuery(
+                    "SELECT * FROM " + Message.TABLENAME + " " +
+                            "WHERE " + Message.UUID + " IN (" +
+                            "SELECT " + Message.UUID + " FROM " + Message.TABLENAME +
+                            " WHERE " + Message.CONVERSATION + "=? AND " + Message.PARENT_UUID + " IS NULL AND (" +
+                            Message.TIME_SENT + comparsionOperation + " ? OR (" + Message.TIME_SENT + " = ? AND " + Message.UUID + comparsionOperation + " ?)) " +
+                            "ORDER BY " + Message.TIME_SENT + sorting + "," + Message.UUID + sorting +
+                            "LIMIT " + String.valueOf(limit) + ") " +
+                            "ORDER BY " + Message.TIME_SENT + sorting + "," + Message.UUID + sorting,
+                    selectionArgs
+            );
+        }
+        CursorUtils.upgradeCursorWindowSize(cursor);
+        final Multimap<String, Message> waitingForReplies = HashMultimap.create();
+        final var replyIds = new HashSet<String>();
+        while (cursor.moveToNext()) {
+            try {
+                final var m = Message.fromCursor(cursor, conversation);
+                final var reply = m.getReply();
+                if (reply != null && reply.getAttribute("id") != null) { // Guard against busted replies
+                    replyIds.add(reply.getAttribute("id"));
+                    waitingForReplies.put(reply.getAttribute("id"), m);
+                }
+                if (isForward) {
+                    list.add(m);
+                } else {
+                    list.add(0, m);
+                }
+            } catch (Exception e) {
+                Log.e(Config.LOGTAG, "unable to restore message", e);
+            }
+        }
+        for (final var parent : getMessageFuzzyIds(conversation, replyIds).entrySet()) {
+            for (final var m : waitingForReplies.get(parent.getKey())) {
+                m.setInReplyTo(parent.getValue());
+            }
+        }
+        cursor.close();
+        attachChildMessages(conversation, list);
+        return list;
+    }
+
+    /**
+     * Loads the extra files of every multi-file message in {@code messages} and hangs them off
+     * their parent. The child rows are filtered out of the message list queries themselves, so
+     * this is the only way they reach the UI.
+     */
+    private void attachChildMessages(final Conversation conversation, final List<Message> messages) {
+        if (messages.isEmpty()) {
+            return;
+        }
+        final Map<String, Message> parents = new Hashtable<>();
+        for (final Message message : messages) {
+            parents.put(message.getUuid(), message);
+        }
+        final SQLiteDatabase db = this.getReadableDatabase();
+        final List<String> uuids = new ArrayList<>(parents.keySet());
+        // SQLite caps the number of host parameters per statement, so ask in chunks.
+        for (int offset = 0; offset < uuids.size(); offset += 500) {
+            final List<String> chunk = uuids.subList(offset, Math.min(offset + 500, uuids.size()));
+            final List<String> template = new ArrayList<>();
+            for (int i = 0; i < chunk.size(); i++) {
+                template.add("?");
+            }
+            try (final Cursor cursor =
+                         db.rawQuery(
+                                 // The files of one message share its timeSent, and their uuids
+                                 // are random, so ordering by those two put the files of an
+                                 // album in an arbitrary order. rowid is the order they were
+                                 // written in, which is the order they were sent in.
+                                 "SELECT * FROM " + Message.TABLENAME
+                                         + " WHERE " + Message.PARENT_UUID + " IN ("
+                                         + TextUtils.join(",", template) + ")"
+                                         + " ORDER BY " + Message.TIME_SENT + " ASC, rowid ASC",
+                                 chunk.toArray(new String[0]))) {
+                CursorUtils.upgradeCursorWindowSize(cursor);
+                while (cursor.moveToNext()) {
+                    try {
+                        final Message child = Message.fromCursor(cursor, conversation);
+                        final Message parent = parents.get(child.getParentUuid());
+                        if (parent != null) {
+                            parent.addAttachment(child);
+                        }
+                    } catch (final Exception e) {
+                        Log.e(Config.LOGTAG, "unable to restore attached file", e);
+                    }
+                }
+            }
+        }
+    }
+
+    public ArrayList<Message> getMessages(Conversation conversation, int limit, long timestamp, boolean isForward) {
+        return getMessages(conversation, limit, timestamp, "", isForward);
+    }
+
+
+    public Cursor getMessageSearchCursor(final List<String> term, final String uuid) {
+        final SQLiteDatabase db = this.getReadableDatabase();
+        final String matchString = FtsUtils.toMatchString(term);
+        // Use a subquery so SQLite drives the query from the FTS index: it resolves the MATCH
+        // to a small set of rowids first, then fetches only those rows from messages by rowid
+        // (the fastest possible access). The old 3-table JOIN left query plan choice ambiguous.
+        final String columns = "m.*, c." + Conversation.CONTACTJID
+                + ", c." + Conversation.ACCOUNT + ", c." + Conversation.MODE;
+        final String encryptionFilter = Message.ENCRYPTION + " NOT IN("
+                + Message.ENCRYPTION_AXOLOTL_NOT_FOR_THIS_DEVICE + ","
+                + Message.ENCRYPTION_PGP + ","
+                + Message.ENCRYPTION_DECRYPTION_FAILED + ","
+                + Message.ENCRYPTION_AXOLOTL_FAILED + ","
+                + Message.ENCRYPTION_AXOLOTL_OMEMO2_NOT_FOR_THIS_DEVICE + ","
+                + Message.ENCRYPTION_AXOLOTL_OMEMO2_FAILED + ")";
+        // Include file/image types so that captioned files surface in search (their caption text
+        // is stored in the body and FTS-indexed). Pure (caption-less) file messages are dropped
+        // later in MessageSearchTask because their display body is blank after URL stripping.
+        final String typeFilter = Message.TYPE + " IN("
+                + Message.TYPE_TEXT + "," + Message.TYPE_PRIVATE + ","
+                + Message.TYPE_IMAGE + "," + Message.TYPE_FILE + ","
+                + Message.TYPE_PRIVATE_FILE + ")";
+        final StringBuilder SQL = new StringBuilder();
+        final String[] selectionArgs;
+        SQL.append("SELECT ").append(columns)
+                .append(" FROM ").append(Message.TABLENAME).append(" m")
+                .append(" JOIN ").append(Conversation.TABLENAME).append(" c ON m.")
+                .append(Message.CONVERSATION).append("=c.").append(Conversation.UUID)
+                .append(" WHERE m.rowid IN (SELECT rowid FROM messages_index WHERE body MATCH ?)")
+                .append(" AND ").append(encryptionFilter)
+                .append(" AND ").append(typeFilter);
+        if (uuid == null) {
+            selectionArgs = new String[] {matchString};
+        } else {
+            selectionArgs = new String[] {matchString, uuid};
+            SQL.append(" AND c.").append(Conversation.UUID).append("=?");
+        }
+        SQL.append(" ORDER BY m.").append(Message.TIME_SENT)
+                .append(" DESC LIMIT ").append(Config.MAX_SEARCH_RESULTS);
+        Log.d(Config.LOGTAG, "search term: " + matchString);
+        return db.rawQuery(SQL.toString(), selectionArgs);
+    }
+
+    public List<String> markFileAsDeleted(final File file, final boolean internal) {
+        SQLiteDatabase db = this.getReadableDatabase();
+        String selection;
+        String[] selectionArgs;
+        if (internal) {
+            final String name = file.getName();
+            if (name.endsWith(".pgp")) {
+                selection =
+                        "("
+                                + Message.RELATIVE_FILE_PATH
+                                + " IN(?,?) OR ("
+                                + Message.RELATIVE_FILE_PATH
+                                + "=? and encryption in(1,4))) and type in (1,2,5)";
+                selectionArgs =
+                        new String[] {
+                            file.getAbsolutePath(), name, name.substring(0, name.length() - 4)
+                        };
+            } else {
+                selection = Message.RELATIVE_FILE_PATH + " IN(?,?) and type in (1,2,5)";
+                selectionArgs = new String[] {file.getAbsolutePath(), name};
+            }
+        } else {
+            selection = Message.RELATIVE_FILE_PATH + "=? and type in (1,2,5)";
+            selectionArgs = new String[] {file.getAbsolutePath()};
+        }
+        final List<String> uuids = new ArrayList<>();
+        Cursor cursor =
+                db.query(
+                        Message.TABLENAME,
+                        new String[] {Message.UUID},
+                        selection,
+                        selectionArgs,
+                        null,
+                        null,
+                        null);
+        while (cursor != null && cursor.moveToNext()) {
+            uuids.add(cursor.getString(0));
+        }
+        if (cursor != null) {
+            cursor.close();
+        }
+        markFileAsDeleted(uuids);
+        return uuids;
+    }
+
+    public void markFileAsDeleted(List<String> uuids) {
+        SQLiteDatabase db = this.getReadableDatabase();
+        final ContentValues contentValues = new ContentValues();
+        final String where = Message.UUID + "=?";
+        contentValues.put(Message.DELETED, 1);
+        db.beginTransaction();
+        for (String uuid : uuids) {
+            db.update(Message.TABLENAME, contentValues, where, new String[] {uuid});
+        }
+        db.setTransactionSuccessful();
+        db.endTransaction();
+    }
+
+    public void markFilesAsChanged(List<FilePathInfo> files) {
+        SQLiteDatabase db = this.getReadableDatabase();
+        final String where = Message.UUID + "=?";
+        db.beginTransaction();
+        for (FilePathInfo info : files) {
+            final ContentValues contentValues = new ContentValues();
+            contentValues.put(Message.DELETED, info.deleted ? 1 : 0);
+            db.update(Message.TABLENAME, contentValues, where, new String[] {info.uuid.toString()});
+        }
+        db.setTransactionSuccessful();
+        db.endTransaction();
+    }
+
+    public List<FilePathInfo> getFilePathInfo() {
+        final SQLiteDatabase db = this.getReadableDatabase();
+        final Cursor cursor =
+                db.query(
+                        Message.TABLENAME,
+                        new String[] {Message.UUID, Message.RELATIVE_FILE_PATH, Message.DELETED},
+                        "type in (1,2,5) and " + Message.RELATIVE_FILE_PATH + " is not null",
+                        null,
+                        null,
+                        null,
+                        null);
+        final List<FilePathInfo> list = new ArrayList<>();
+        while (cursor != null && cursor.moveToNext()) {
+            list.add(
+                    new FilePathInfo(
+                            cursor.getString(0), cursor.getString(1), cursor.getInt(2) > 0));
+        }
+        if (cursor != null) {
+            cursor.close();
+        }
+        return list;
+    }
+
+    public List<FilePath> getRelativeFilePaths(String account, Jid jid, String query, int limit) {
+        return getRelativeFilePaths(account, jid, query, limit, false);
+    }
+
+    /**
+     * @param chronological hand the files back oldest first instead of newest first. The limit
+     *     always cuts away the oldest files, whichever order they are returned in.
+     */
+    public List<FilePath> getRelativeFilePaths(String account, Jid jid, String query, int limit, boolean chronological) {
+        SQLiteDatabase db = this.getReadableDatabase();
+        StringBuilder sqlBuilder = new StringBuilder("select uuid,relativeFilePath,timeSent,conversationUuid,rowid as sortId from messages where type in (1,2,5) and deleted=0 and " + Message.RELATIVE_FILE_PATH + " is not null");
+        List<String> args = new ArrayList<>();
+
+        if (account != null && jid != null) {
+            sqlBuilder.append(" and conversationUuid=(select uuid from conversations where accountUuid=? and (contactJid=? or contactJid like ?))");
+            args.add(account);
+            args.add(jid.toString());
+            args.add(jid.toString() + "/%");
+        }
+
+        if (!TextUtils.isEmpty(query)) {
+            if (query.matches("\\d{4}-\\d{2}-\\d{2}")) {
+                sqlBuilder.append(" and date(" + Message.TIME_SENT + " / 1000, 'unixepoch', 'localtime') = ?");
+                args.add(query);
+            } else {
+                sqlBuilder.append(" and (body like ? or " + Message.RELATIVE_FILE_PATH + " like ?)");
+                args.add("%" + query + "%");
+                args.add("%" + query + "%");
+            }
+        }
+
+        // Every file of a multi-file message carries that message's timeSent, so the time on its
+        // own leaves their order to SQLite — and an order that changes between queries is what
+        // makes the media viewer swipe the wrong way. rowid is the order the rows were written
+        // in, which for the files of one message is the order they were sent in.
+        sqlBuilder.append(" order by " + Message.TIME_SENT + " desc, sortId asc");
+        if (limit > 0) {
+            sqlBuilder.append(" limit ").append(limit);
+        }
+        final String sql =
+                chronological
+                        ? "select * from (" + sqlBuilder + ") order by " + Message.TIME_SENT + " asc, sortId asc"
+                        : sqlBuilder.toString();
+
+        Cursor cursor = db.rawQuery(sql, args.toArray(new String[0]));
+        List<FilePath> filesPaths = new ArrayList<>();
+        while (cursor.moveToNext()) {
+            filesPaths.add(new FilePath(cursor.getString(0), cursor.getString(1), cursor.getLong(2), cursor.getString(3)));
+        }
+        cursor.close();
+        return filesPaths;
+    }
+
+    public Map<Integer, FilePath> getRelativeFilePathsForConversationForMonth(String conversationUuid, int year, int month) {
+        final var db = this.getReadableDatabase();
+
+        Map<Integer, FilePath> dayToFilePath = new HashMap<>();
+
+        // Calculate the start and end timestamps for the given month
+        Calendar calendar = Calendar.getInstance();
+        calendar.set(year, month - 1, 1, 0, 0, 0); // Month is 0-indexed in Calendar
+        calendar.set(Calendar.MILLISECOND, 0);
+        long startTimeMillis = calendar.getTimeInMillis();
+
+        calendar.add(Calendar.MONTH, 1);
+        calendar.add(Calendar.MILLISECOND, -1);
+        long endTimeMillis = calendar.getTimeInMillis();
+
+        long offset = TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 1000;
+
+        String sql = "SELECT " +
+                Message.UUID + ", " +
+                Message.RELATIVE_FILE_PATH + ", " +
+                "CAST(strftime('%d', " + Message.TIME_SENT + " / 1000 + " + offset +", 'unixepoch') AS INTEGER) AS day_of_month, " +
+                "COUNT(" + Message.UUID + ") AS message_count " +
+                "FROM " + Message.TABLENAME + " " +
+                "WHERE " + Message.CONVERSATION + " = ? " +
+                "AND " + Message.TIME_SENT + " >= ? " +
+                "AND " + Message.TIME_SENT + " <= ? " +
+                "AND " + Message.DELETED + " = 0 " +
+                "AND " + Message.RELATIVE_FILE_PATH + " IS NOT NULL " +
+                "GROUP BY day_of_month " +
+                "ORDER BY day_of_month ASC;";
+
+        String[] selectionArgs = {
+                conversationUuid,
+                String.valueOf(startTimeMillis),
+                String.valueOf(endTimeMillis)
+        };
+
+        Cursor cursor = db.rawQuery(sql, selectionArgs);
+
+        if (cursor != null) {
+            try {
+                int dayOfMonthIndex = cursor.getColumnIndex("day_of_month");
+                int messageCountIndex = cursor.getColumnIndex("message_count");
+                int uuidIndex = cursor.getColumnIndex(Message.UUID);
+                int relativePathIndex = cursor.getColumnIndex(Message.RELATIVE_FILE_PATH);
+
+                if (dayOfMonthIndex != -1 && messageCountIndex != -1) {
+                    while (cursor.moveToNext()) {
+                        int day = cursor.getInt(dayOfMonthIndex);
+                        String uuid = cursor.getString(uuidIndex);
+                        String relativePath = cursor.getString(relativePathIndex);
+                        dayToFilePath.put(day, new FilePath(uuid, relativePath, 0, conversationUuid));
+                    }
+                }
+            } finally {
+                cursor.close();
+            }
+        }
+        return dayToFilePath;
+
+
+        /*Calendar calendar = Calendar.getInstance();
+        calendar.set(year, month - 1, 1, 0, 0, 0); // Month is 0-indexed in Calendar
+        calendar.set(Calendar.MILLISECOND, 0);
+        long startTimeMillis = calendar.getTimeInMillis();
+
+        calendar.add(Calendar.MONTH, 1);
+        calendar.add(Calendar.MILLISECOND, -1);
+        long endTimeMillis = calendar.getTimeInMillis();
+
+        SQLiteDatabase db = this.getReadableDatabase();
+        final String SQL =
+                "select uuid,relativeFilePath from messages where type in (1,2,5) and deleted=0 and"
+                        + " "
+                        + Message.RELATIVE_FILE_PATH
+                        + " is not null and conversationUuid=? AND " + Message.TIME_SENT + " >= ? AND " + Message.TIME_SENT + " <= ?  order by"
+                        + " timeSent desc";
+        String[] args = {
+                uuid,
+                String.valueOf(startTimeMillis),
+                String.valueOf(endTimeMillis)
+        };
+        Cursor cursor = db.rawQuery(SQL, args);
+        List<FilePath> filesPaths = new ArrayList<>();
+        while (cursor.moveToNext()) {
+            filesPaths.add(new FilePath(cursor.getString(0), cursor.getString(1)));
+        }
+        cursor.close();
+        return filesPaths; */
+    }
+
+    public Message getMessageWithServerMsgId(
+            final Conversation conversation, final String messageId) {
+        final var db = this.getReadableDatabase();
+        final String sql =
+                "select * from messages where conversationUuid=? and serverMsgId=? LIMIT 1";
+        final String[] args = {conversation.getUuid(), messageId};
+        final Cursor cursor = db.rawQuery(sql, args);
+        if (cursor == null) {
+            return null;
+        }
+        Message message = null;
+        try {
+            if (cursor.moveToFirst()) {
+                message = Message.fromCursor(cursor, conversation);
+            }
+        } catch (final IOException e) { }
+        cursor.close();
+        return message;
+    }
+
+    public Message getMessageWithUuidOrRemoteId(
+            final Conversation conversation, final String messageId) {
+        final var db = this.getReadableDatabase();
+        final String sql =
+                "select * from messages where conversationUuid=? and (uuid=? OR remoteMsgId=?) LIMIT 1";
+        final String[] args = {conversation.getUuid(), messageId, messageId};
+        final Cursor cursor = db.rawQuery(sql, args);
+        if (cursor == null) {
+            return null;
+        }
+        Message message = null;
+        try {
+            if (cursor.moveToFirst()) {
+                message = Message.fromCursor(cursor, conversation);
+            }
+        } catch (final IOException e) { }
+        cursor.close();
+        return message;
+    }
+
+    public boolean updateContact(final Contact contact) {
+        final SQLiteDatabase db = this.getWritableDatabase();final ContentValues values = contact.getContentValues();
+        final String[] args = {contact.getAccount().getUuid(), contact.getJid().asBareJid().toString()};
+        try {
+            final int count = db.update(Contact.TABLENAME, values,
+                    Contact.ACCOUNT + "=? AND " + Contact.JID + "=?",
+                    args);
+            return count > 0;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    public static class FilePath {
+        public final UUID uuid;
+        public final String path;
+        public final long timestamp;
+        public final String conversationUuid;
+
+        private FilePath(String uuid, String path, long timestamp, String conversationUuid) {
+            this.uuid = UUID.fromString(uuid);
+            this.path = path;
+            this.timestamp = timestamp;
+            this.conversationUuid = conversationUuid;
+        }
+    }
+
+    public static class FilePathInfo extends FilePath {
+        public boolean deleted;
+
+        private FilePathInfo(String uuid, String path, boolean deleted) {
+            super(uuid, path, 0, null);
+            this.deleted = deleted;
+        }
+
+        public boolean setDeleted(boolean deleted) {
+            final boolean changed = deleted != this.deleted;
+            this.deleted = deleted;
+            return changed;
+        }
+    }
+
+    public Conversation findConversation(final String uuid) {
+        final var db = this.getReadableDatabase();
+        final String[] selectionArgs = {uuid};
+        try (final Cursor cursor =
+                db.query(
+                        Conversation.TABLENAME,
+                        null,
+                        Conversation.UUID + "=?",
+                        selectionArgs,
+                        null,
+                        null,
+                        null)) {
+            if (cursor.getCount() == 0) {
+                return null;
+            }
+            cursor.moveToFirst();
+            final Conversation conversation = Conversation.fromCursor(cursor);
+            if (conversation.getJid() instanceof Jid.Invalid) {
+                return null;
+            }
+            return conversation;
+        }
+    }
+
+    public Conversation findConversation(final Account account, final Jid contactJid) {
+        final SQLiteDatabase db = this.getReadableDatabase();
+        final String[] selectionArgs = {
+            account.getUuid(),
+            contactJid.asBareJid().toString() + "/%",
+            contactJid.asBareJid().toString()
+        };
+        try (final Cursor cursor =
+                db.query(
+                        Conversation.TABLENAME,
+                        null,
+                        Conversation.ACCOUNT
+                                + "=? AND ("
+                                + Conversation.CONTACTJID
+                                + " like ? OR "
+                                + Conversation.CONTACTJID
+                                + "=?)",
+                        selectionArgs,
+                        null,
+                        null,
+                        null)) {
+            if (cursor.getCount() == 0) {
+                return null;
+            }
+            cursor.moveToFirst();
+            final Conversation conversation = Conversation.fromCursor(cursor);
+            if (conversation.getJid() instanceof Jid.Invalid) {
+                return null;
+            }
+            conversation.setAccount(account);
+            return conversation;
+        }
+    }
+
+    public String findConversationUuid(final Jid account, final Jid jid) {
+        final SQLiteDatabase db = this.getReadableDatabase();
+        final String[] selectionArgs = {
+                account.getLocal(),
+                account.getDomain().toString(),
+                jid.asBareJid().toString() + "/%",
+                jid.asBareJid().toString()
+        };
+        try (final Cursor cursor =
+                     db.rawQuery(
+                             "SELECT conversations.uuid FROM conversations JOIN accounts ON"
+                                     + " conversations.accountUuid=accounts.uuid WHERE accounts.username=?"
+                                     + " AND accounts.server=? AND (contactJid=? OR contactJid LIKE ?)",
+                             selectionArgs)) {
+            if (cursor.getCount() == 0) {
+                return null;
+            }
+            cursor.moveToFirst();
+            return cursor.getString(0);
+        }
+    }
+
+    public void updateConversation(final Conversation conversation) {
+        final SQLiteDatabase db = this.getWritableDatabase();
+        final String[] args = {conversation.getUuid()};
+        db.update(
+                Conversation.TABLENAME,
+                conversation.getContentValues(),
+                Conversation.UUID + "=?",
+                args);
+    }
+
+    public String getAccountUuidForConversation(String conversationUuid) {
+        final SQLiteDatabase db = this.getReadableDatabase();
+        try (Cursor cursor = db.query(Conversation.TABLENAME, new String[]{Conversation.ACCOUNT}, Conversation.UUID + "=?", new String[]{conversationUuid}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                return cursor.getString(0);
+            }
+        }
+        return null;
+    }
+
+    public List<Account> getAccounts() {
+        try {
+            SQLiteDatabase db = this.getReadableDatabase();
+            return getAccounts(db);
+        } catch (final Exception e) {
+            return new ArrayList<>();
+        }
+    }
+
+    public List<Jid> getAccountJids(final boolean enabledOnly) {
+        final SQLiteDatabase db = this.getReadableDatabase();
+        final List<Jid> jids = new ArrayList<>();
+        final String[] columns = new String[] {Account.USERNAME, Account.SERVER};
+        final String where = enabledOnly ? "not options & (1 <<1)" : null;
+        try (final Cursor cursor =
+                db.query(Account.TABLENAME, columns, where, null, null, null, null)) {
+            while (cursor != null && cursor.moveToNext()) {
+                jids.add(Jid.of(cursor.getString(0), cursor.getString(1), null));
+            }
+        } catch (final Exception e) {
+            return jids;
+        }
+        return jids;
+    }
+
+    private List<Account> getAccounts(SQLiteDatabase db) {
+        final List<Account> list = new ArrayList<>();
+        try (final Cursor cursor =
+                     db.query(Account.TABLENAME, null, null, null, null, null, Account.ORDERING + " ASC")) { // Use constant here
+            while (cursor != null && cursor.moveToNext()) {
+                list.add(Account.fromCursor(cursor));
+            }
+        }
+        return list;
+    }
+
+    public boolean updateAccount(Account account) {
+        final var db = this.getWritableDatabase();
+        final String[] args = {account.getUuid()};
+        final ContentValues values = account.getContentValues();
+        final int rows =
+                db.update(Account.TABLENAME, values, Account.UUID + "=?", args);
+        return rows == 1;
+    }
+
+    public boolean deleteAccount(final Account account) {
+        final var db = this.getWritableDatabase();
+        final String[] args = {account.getUuid()};
+        final int rows = db.delete(Account.TABLENAME, Account.UUID + "=?", args);
+        return rows == 1;
+    }
+
+    public boolean updateMessage(final Message message, final boolean includeBody) {
+        final var db = this.getWritableDatabase();
+        final String[] args = {message.getUuid()};
+        final var contentValues = message.getContentValues();
+        contentValues.remove(Message.UUID);
+        if (!includeBody) {
+            contentValues.remove(Message.BODY);
+        }
+        return db.update(Message.TABLENAME, contentValues, Message.UUID + "=?", args) == 1;
+    }
+
+    public boolean updateMessage(Message message, String uuid) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        String[] args = {uuid};
+        return db.update(Message.TABLENAME, message.getContentValues(), Message.UUID + "=?", args) == 1;
+    }
+
+
+    public boolean deleteMessage(String uuid) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        String[] args = {uuid};
+        // The extra files of a multi-file message have no bubble of their own, so they would
+        // become unreachable rows if the parent went away without them.
+        db.delete(Message.TABLENAME, Message.PARENT_UUID + "=?", args);
+        return db.delete(Message.TABLENAME, Message.UUID + "=?", args) == 1 &&
+                db.delete("" + Message.TABLENAME, Message.UUID + "=?", args) == 1;
+    }
+
+    /**
+     * Returns a list of relative file paths for messages in the given conversation
+     * that are not referenced by any other conversation's messages.
+     */
+    public List<String> getExclusiveFilePaths(final Conversation conversation) {
+        final List<String> paths = new ArrayList<>();
+        final SQLiteDatabase db = this.getReadableDatabase();
+        final String sql = "SELECT DISTINCT m." + Message.RELATIVE_FILE_PATH
+                + " FROM " + Message.TABLENAME + " m"
+                + " WHERE m." + Message.CONVERSATION + "=?"
+                + " AND m." + Message.RELATIVE_FILE_PATH + " IS NOT NULL"
+                + " AND NOT EXISTS ("
+                + "SELECT 1 FROM " + Message.TABLENAME + " m2"
+                + " WHERE m2." + Message.RELATIVE_FILE_PATH + "=m." + Message.RELATIVE_FILE_PATH
+                + " AND m2." + Message.CONVERSATION + "!=?"
+                + ")";
+        try (Cursor cursor = db.rawQuery(sql, new String[]{conversation.getUuid(), conversation.getUuid()})) {
+            while (cursor.moveToNext()) {
+                final String relativePath = cursor.getString(0);
+                if (relativePath != null) {
+                    paths.add(relativePath);
+                }
+            }
+        }
+        return paths;
+    }
+
+    public String getExclusiveFilePath(final Message message) {
+        final String relativePath = message.getRelativeFilePath();
+        if (relativePath == null) {
+            return null;
+        }
+        final SQLiteDatabase db = this.getReadableDatabase();
+        final String sql = "SELECT 1 FROM " + Message.TABLENAME
+                + " WHERE " + Message.RELATIVE_FILE_PATH + "=?"
+                + " AND " + Message.UUID + "!=?"
+                + " LIMIT 1";
+        try (Cursor cursor = db.rawQuery(sql, new String[]{relativePath, message.getUuid()})) {
+            if (cursor.getCount() == 0) {
+                return relativePath;
+            }
+        }
+        return null;
+    }
+
+    public void readRoster(Roster roster) {
+        final SQLiteDatabase db = this.getReadableDatabase();
+        final String[] args = {roster.getAccount().getUuid()};
+        try (final Cursor cursor =
+                     db.query(Contact.TABLENAME, null, Contact.ACCOUNT + "=?", args, null, null, null)) {
+            while (cursor.moveToNext()) {
+                roster.initContact(Contact.fromCursor(cursor));
+            }
+        }
+    }
+
+    public void writeRoster(final Roster roster) {
+        long start = SystemClock.elapsedRealtime();
+        final Account account = roster.getAccount();
+        final SQLiteDatabase db = this.getWritableDatabase();
+        db.beginTransaction();
+        for (Contact contact : roster.getContacts()) {
+            if (contact.getOption(Contact.Options.IN_ROSTER)
+                    || contact.hasAvatarOrPresenceName()
+                    || contact.getOption(Contact.Options.SYNCED_VIA_OTHER)) {
+                db.insert(Contact.TABLENAME, null, contact.getContentValues());
+            } else {
+                String where = Contact.ACCOUNT + "=? AND " + Contact.JID + "=?";
+                String[] whereArgs = {account.getUuid(), contact.getJid().toString()};
+                db.delete(Contact.TABLENAME, where, whereArgs);
+            }
+        }
+        db.setTransactionSuccessful();
+        db.endTransaction();
+        account.setRosterVersion(roster.getVersion());
+        updateAccount(account);
+        long duration = SystemClock.elapsedRealtime() - start;
+        Log.d(
+                Config.LOGTAG,
+                account.getJid().asBareJid() + ": persisted roster in " + duration + "ms");
+    }
+
+    public void deleteMessagesInConversation(Conversation conversation) {
+        long start = SystemClock.elapsedRealtime();
+        final SQLiteDatabase db = this.getWritableDatabase();
+        db.beginTransaction();
+        final String[] args = {conversation.getUuid()};
+        int num = db.delete(Message.TABLENAME, Message.CONVERSATION + "=?", args);
+        db.delete("webxdc_updates", Message.CONVERSATION + "=?", args);
+        db.delete(PinnedMessage.TABLENAME, PinnedMessage.CONVERSATION_UUID + "=?", args);
+        db.setTransactionSuccessful();
+        db.endTransaction();
+        Log.d(
+                Config.LOGTAG,
+                "deleted "
+                        + num
+                        + " messages and associated data for "
+                        + conversation.getJid().asBareJid()
+                        + " in "
+                        + (SystemClock.elapsedRealtime() - start)
+                        + "ms");
+    }
+
+    public void pinMessage(String messageUuid, String conversationUuid, String accountUuid, String body, String cid, long timestamp) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        ContentValues values = new ContentValues();
+        values.put(PinnedMessage.MESSAGE_UUID, messageUuid);
+        values.put(PinnedMessage.CONVERSATION_UUID, conversationUuid);
+        values.put(PinnedMessage.ACCOUNT_UUID, accountUuid);
+        values.put(PinnedMessage.BODY, body);
+        values.put(PinnedMessage.TIMESTAMP, timestamp);
+        values.put(PinnedMessage.CID, cid);
+        db.insertWithOnConflict(PinnedMessage.TABLENAME, null, values, SQLiteDatabase.CONFLICT_REPLACE);
+    }
+
+    public void unpinMessage(String messageUuid) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        db.delete(PinnedMessage.TABLENAME, PinnedMessage.MESSAGE_UUID + "=?", new String[]{messageUuid});
+    }
+
+    public Cursor getPinnedMessages(String conversationUuid) {
+        SQLiteDatabase db = this.getReadableDatabase();
+        return db.query(PinnedMessage.TABLENAME, null, PinnedMessage.CONVERSATION_UUID + "=?", new String[]{conversationUuid}, null, null, PinnedMessage.TIMESTAMP + " DESC");
+    }
+
+    public void deletePinnedMessage(String conversationUuid, String messageUuid) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        db.delete(PinnedMessage.TABLENAME, PinnedMessage.CONVERSATION_UUID + "=? and " + PinnedMessage.MESSAGE_UUID + "=?", new String[]{conversationUuid, messageUuid});
+    }
+
+    public void expireOldMessages(long timestamp) {
+        final String[] args = {String.valueOf(timestamp)};
+        SQLiteDatabase db = this.getWritableDatabase();
+        db.beginTransaction();
+        db.delete(Message.TABLENAME, "timeSent<?", args);
+        db.delete("messages", "timeReceived<?", args);
+        ContentValues values = new ContentValues();
+        values.put(Message.BODY, (String) null);
+        values.put(Message.SUBJECT, (String) null);
+        values.put(Message.DELETED, 1);
+        if (columnExists(db, Message.TABLENAME, "file_deleted")) {
+            values.put("file_deleted", 1);
+        }
+        values.put(Message.RELATIVE_FILE_PATH, (String) null);
+        values.put(Message.ENCRYPTION, Message.ENCRYPTION_NONE);
+        values.put(Message.REACTIONS, (String) null);
+        db.update(Message.TABLENAME, values, Message.EXPIRE_AT + " > 0 AND " + Message.EXPIRE_AT + " < ?", new String[]{String.valueOf(System.currentTimeMillis())});
+        db.setTransactionSuccessful();
+        db.endTransaction();
+    }
+
+    public long getNextExpiration() {
+        SQLiteDatabase db = this.getReadableDatabase();
+        String query = "SELECT MIN(" + Message.EXPIRE_AT + ") FROM " + Message.TABLENAME + " WHERE " + Message.EXPIRE_AT + " > 0";
+        try (Cursor cursor = db.rawQuery(query, null)) {
+            if (cursor.moveToFirst()) {
+                return cursor.getLong(0);
+            }
+        }
+        return 0;
+    }
+
+    public List<String> getExclusiveFilePathsExpiring(long historyTimestamp) {
+        final List<String> paths = new ArrayList<>();
+        final SQLiteDatabase db = this.getReadableDatabase();
+        final long now = System.currentTimeMillis();
+        final String sql = "SELECT DISTINCT m." + Message.RELATIVE_FILE_PATH
+                + " FROM " + Message.TABLENAME + " m"
+                + " WHERE ((" + Message.EXPIRE_AT + " > 0 AND " + Message.EXPIRE_AT + " < ?)"
+                + " OR (" + Message.TIME_SENT + " < ? AND ? > 0))"
+                + " AND m." + Message.RELATIVE_FILE_PATH + " IS NOT NULL"
+                + " AND NOT EXISTS ("
+                + "SELECT 1 FROM " + Message.TABLENAME + " m2"
+                + " WHERE m2." + Message.RELATIVE_FILE_PATH + "=m." + Message.RELATIVE_FILE_PATH
+                + " AND NOT ((" + Message.EXPIRE_AT + " > 0 AND " + Message.EXPIRE_AT + " < ?)"
+                + " OR (" + Message.TIME_SENT + " < ? AND ? > 0))"
+                + ")";
+        try (Cursor cursor = db.rawQuery(sql, new String[]{
+                String.valueOf(now), String.valueOf(historyTimestamp), String.valueOf(historyTimestamp),
+                String.valueOf(now), String.valueOf(historyTimestamp), String.valueOf(historyTimestamp)
+        })) {
+            while (cursor.moveToNext()) {
+                paths.add(cursor.getString(0));
+            }
+        }
+        return paths;
+    }
+
+    public MamReference getLastMessageReceived(Account account) {
+        Cursor cursor = null;
+        try {
+            SQLiteDatabase db = this.getReadableDatabase();
+            String sql =
+                    "select messages.timeSent,messages.serverMsgId from accounts join conversations"
+                        + " on accounts.uuid=conversations.accountUuid join messages on"
+                        + " conversations.uuid=messages.conversationUuid where accounts.uuid=? and"
+                        + " (messages.status=0 or messages.carbon=1 or messages.serverMsgId not"
+                        + " null) and (conversations.mode=0 or (messages.serverMsgId not null and"
+                        + " messages.type=4)) order by messages.timesent desc limit 1";
+            String[] args = {account.getUuid()};
+            cursor = db.rawQuery(sql, args);
+            if (cursor.getCount() == 0) {
+                return null;
+            } else {
+                cursor.moveToFirst();
+                return new MamReference(cursor.getLong(0), cursor.getString(1));
+            }
+        } catch (Exception e) {
+            return null;
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+    }
+
+    public long getLastTimeFingerprintUsed(Account account, String fingerprint) {
+        String SQL =
+                "select messages.timeSent from accounts join conversations on"
+                        + " accounts.uuid=conversations.accountUuid join messages on"
+                        + " conversations.uuid=messages.conversationUuid where accounts.uuid=? and"
+                        + " messages.axolotl_fingerprint=? order by messages.timesent desc limit 1";
+        String[] args = {account.getUuid(), fingerprint};
+        Cursor cursor = getReadableDatabase().rawQuery(SQL, args);
+        long time;
+        if (cursor.moveToFirst()) {
+            time = cursor.getLong(0);
+        } else {
+            time = 0;
+    }
+        cursor.close();
+        return time;
+    }
+
+    public MamReference getLastClearDate(Account account) {
+        SQLiteDatabase db = this.getReadableDatabase();
+        String[] columns = {Conversation.ATTRIBUTES};
+        String selection = Conversation.ACCOUNT + "=?";
+        String[] args = {account.getUuid()};
+        Cursor cursor =
+                db.query(Conversation.TABLENAME, columns, selection, args, null, null, null);
+        MamReference maxClearDate = new MamReference(0);
+        while (cursor.moveToNext()) {
+            try {
+                final JSONObject o = new JSONObject(cursor.getString(0));
+                maxClearDate =
+                        MamReference.max(
+                                maxClearDate,
+                                MamReference.fromAttribute(
+                                        o.getString(Conversation.ATTRIBUTE_LAST_CLEAR_HISTORY)));
+            } catch (Exception e) {
+                // ignored
+            }
+        }
+        cursor.close();
+        return maxClearDate;
+    }
+
+    private Cursor getCursorForSession(Account account, SignalProtocolAddress contact) {
+        final SQLiteDatabase db = this.getReadableDatabase();
+        String[] selectionArgs = {
+            account.getUuid(), contact.getName(), Integer.toString(contact.getDeviceId())
+        };
+        return db.query(
+                SQLiteAxolotlStore.SESSION_TABLENAME,
+                null,
+                SQLiteAxolotlStore.ACCOUNT
+                        + " = ? AND "
+                        + SQLiteAxolotlStore.NAME
+                        + " = ? AND "
+                        + SQLiteAxolotlStore.DEVICE_ID
+                        + " = ? ",
+                selectionArgs,
+                null,
+                null,
+                null);
+    }
+
+    public SessionRecord loadSession(Account account, SignalProtocolAddress contact) {
+        SessionRecord session = null;
+        Cursor cursor = getCursorForSession(account, contact);
+        if (cursor.getCount() != 0) {
+            cursor.moveToFirst();
+            try {
+                session =
+                        new SessionRecord(
+                                Base64.decode(
+                                        cursor.getString(
+                                                cursor.getColumnIndex(SQLiteAxolotlStore.KEY)),
+                                        Base64.DEFAULT));
+            } catch (InvalidMessageException e) {
+                cursor.close();
+                throw new AssertionError(e);
+            }
+        }
+        cursor.close();
+        return session;
+    }
+
+    public List<Integer> getSubDeviceSessions(Account account, SignalProtocolAddress contact) {
+        final SQLiteDatabase db = this.getReadableDatabase();
+        return getSubDeviceSessions(db, account, contact);
+    }
+
+    private List<Integer> getSubDeviceSessions(
+            SQLiteDatabase db, Account account, SignalProtocolAddress contact) {
+        List<Integer> devices = new ArrayList<>();
+        String[] columns = {SQLiteAxolotlStore.DEVICE_ID};
+        String[] selectionArgs = {account.getUuid(), contact.getName()};
+        Cursor cursor =
+                db.query(
+                        SQLiteAxolotlStore.SESSION_TABLENAME,
+                        columns,
+                        SQLiteAxolotlStore.ACCOUNT + " = ? AND " + SQLiteAxolotlStore.NAME + " = ?",
+                        selectionArgs,
+                        null,
+                        null,
+                        null);
+
+        while (cursor.moveToNext()) {
+            devices.add(cursor.getInt(cursor.getColumnIndex(SQLiteAxolotlStore.DEVICE_ID)));
+        }
+
+        cursor.close();
+        return devices;
+    }
+
+    public List<String> getKnownSignalAddresses(Account account) {
+        List<String> addresses = new ArrayList<>();
+        String[] colums = {"DISTINCT " + SQLiteAxolotlStore.NAME};
+        String[] selectionArgs = {account.getUuid()};
+        Cursor cursor =
+                getReadableDatabase()
+                        .query(
+                                SQLiteAxolotlStore.SESSION_TABLENAME,
+                                colums,
+                                SQLiteAxolotlStore.ACCOUNT + " = ?",
+                                selectionArgs,
+                                null,
+                                null,
+                                null);
+        while (cursor.moveToNext()) {
+            addresses.add(cursor.getString(0));
+        }
+        cursor.close();
+        return addresses;
+    }
+
+    public boolean containsSession(Account account, SignalProtocolAddress contact) {
+        Cursor cursor = getCursorForSession(account, contact);
+        int count = cursor.getCount();
+        cursor.close();
+        return count != 0;
+    }
+
+    public void storeSession(
+            Account account, SignalProtocolAddress contact, SessionRecord session) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        ContentValues values = new ContentValues();
+        values.put(SQLiteAxolotlStore.NAME, contact.getName());
+        values.put(SQLiteAxolotlStore.DEVICE_ID, contact.getDeviceId());
+        values.put(
+                SQLiteAxolotlStore.KEY, Base64.encodeToString(session.serialize(), Base64.DEFAULT));
+        values.put(SQLiteAxolotlStore.ACCOUNT, account.getUuid());
+        db.insert(SQLiteAxolotlStore.SESSION_TABLENAME, null, values);
+    }
+
+    public void deleteSession(Account account, SignalProtocolAddress contact) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        deleteSession(db, account, contact);
+    }
+
+    private void deleteSession(SQLiteDatabase db, Account account, SignalProtocolAddress contact) {
+        String[] args = {
+            account.getUuid(), contact.getName(), Integer.toString(contact.getDeviceId())
+        };
+        db.delete(
+                SQLiteAxolotlStore.SESSION_TABLENAME,
+                SQLiteAxolotlStore.ACCOUNT
+                        + " = ? AND "
+                        + SQLiteAxolotlStore.NAME
+                        + " = ? AND "
+                        + SQLiteAxolotlStore.DEVICE_ID
+                        + " = ? ",
+                args);
+    }
+
+    public void deleteAllSessions(Account account, SignalProtocolAddress contact) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        String[] args = {account.getUuid(), contact.getName()};
+        db.delete(
+                SQLiteAxolotlStore.SESSION_TABLENAME,
+                SQLiteAxolotlStore.ACCOUNT + "=? AND " + SQLiteAxolotlStore.NAME + " = ?",
+                args);
+    }
+
+    private Cursor getCursorForPreKey(Account account, int preKeyId) {
+        SQLiteDatabase db = this.getReadableDatabase();
+        String[] columns = {SQLiteAxolotlStore.KEY};
+        String[] selectionArgs = {account.getUuid(), Integer.toString(preKeyId)};
+        Cursor cursor =
+                db.query(
+                        SQLiteAxolotlStore.PREKEY_TABLENAME,
+                        columns,
+                        SQLiteAxolotlStore.ACCOUNT + "=? AND " + SQLiteAxolotlStore.ID + "=?",
+                        selectionArgs,
+                        null,
+                        null,
+                        null);
+
+        return cursor;
+    }
+
+    public PreKeyRecord loadPreKey(Account account, int preKeyId) {
+        PreKeyRecord record = null;
+        Cursor cursor = getCursorForPreKey(account, preKeyId);
+        if (cursor.getCount() != 0) {
+            cursor.moveToFirst();
+            try {
+                record =
+                        new PreKeyRecord(
+                                Base64.decode(
+                                        cursor.getString(
+                                                cursor.getColumnIndex(SQLiteAxolotlStore.KEY)),
+                                        Base64.DEFAULT));
+            } catch (InvalidMessageException e) {
+                throw new AssertionError(e);
+            }
+        }
+        cursor.close();
+        return record;
+    }
+
+    public boolean containsPreKey(Account account, int preKeyId) {
+        Cursor cursor = getCursorForPreKey(account, preKeyId);
+        int count = cursor.getCount();
+        cursor.close();
+        return count != 0;
+    }
+
+    public void storePreKey(Account account, PreKeyRecord record) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        ContentValues values = new ContentValues();
+        values.put(SQLiteAxolotlStore.ID, record.getId());
+        values.put(
+                SQLiteAxolotlStore.KEY, Base64.encodeToString(record.serialize(), Base64.DEFAULT));
+        values.put(SQLiteAxolotlStore.ACCOUNT, account.getUuid());
+        db.insert(SQLiteAxolotlStore.PREKEY_TABLENAME, null, values);
+    }
+
+    public int deletePreKey(Account account, int preKeyId) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        String[] args = {account.getUuid(), Integer.toString(preKeyId)};
+        return db.delete(
+                SQLiteAxolotlStore.PREKEY_TABLENAME,
+                SQLiteAxolotlStore.ACCOUNT + "=? AND " + SQLiteAxolotlStore.ID + "=?",
+                args);
+    }
+
+    private Cursor getCursorForSignedPreKey(Account account, int signedPreKeyId) {
+        SQLiteDatabase db = this.getReadableDatabase();
+        String[] columns = {SQLiteAxolotlStore.KEY};
+        String[] selectionArgs = {account.getUuid(), Integer.toString(signedPreKeyId)};
+        Cursor cursor =
+                db.query(
+                        SQLiteAxolotlStore.SIGNED_PREKEY_TABLENAME,
+                        columns,
+                        SQLiteAxolotlStore.ACCOUNT + "=? AND " + SQLiteAxolotlStore.ID + "=?",
+                        selectionArgs,
+                        null,
+                        null,
+                        null);
+
+        return cursor;
+    }
+
+    public SignedPreKeyRecord loadSignedPreKey(Account account, int signedPreKeyId) {
+        SignedPreKeyRecord record = null;
+        Cursor cursor = getCursorForSignedPreKey(account, signedPreKeyId);
+        if (cursor.getCount() != 0) {
+            cursor.moveToFirst();
+            try {
+                record =
+                        new SignedPreKeyRecord(
+                                Base64.decode(
+                                        cursor.getString(
+                                                cursor.getColumnIndex(SQLiteAxolotlStore.KEY)),
+                                        Base64.DEFAULT));
+            } catch (InvalidMessageException e) {
+                throw new AssertionError(e);
+            }
+        }
+        cursor.close();
+        return record;
+    }
+
+    public List<SignedPreKeyRecord> loadSignedPreKeys(Account account) {
+        List<SignedPreKeyRecord> prekeys = new ArrayList<>();
+        SQLiteDatabase db = this.getReadableDatabase();
+        String[] columns = {SQLiteAxolotlStore.KEY};
+        String[] selectionArgs = {account.getUuid()};
+        Cursor cursor =
+                db.query(
+                        SQLiteAxolotlStore.SIGNED_PREKEY_TABLENAME,
+                        columns,
+                        SQLiteAxolotlStore.ACCOUNT + "=?",
+                        selectionArgs,
+                        null,
+                        null,
+                        null);
+
+        while (cursor.moveToNext()) {
+            try {
+                prekeys.add(
+                        new SignedPreKeyRecord(
+                                Base64.decode(
+                                        cursor.getString(
+                                                cursor.getColumnIndex(SQLiteAxolotlStore.KEY)),
+                                        Base64.DEFAULT)));
+            } catch (InvalidMessageException ignored) {
+            }
+        }
+        cursor.close();
+        return prekeys;
+    }
+
+    public int getSignedPreKeysCount(Account account) {
+        String[] columns = {"count(" + SQLiteAxolotlStore.KEY + ")"};
+        String[] selectionArgs = {account.getUuid()};
+        SQLiteDatabase db = this.getReadableDatabase();
+        Cursor cursor =
+                db.query(
+                        SQLiteAxolotlStore.SIGNED_PREKEY_TABLENAME,
+                        columns,
+                        SQLiteAxolotlStore.ACCOUNT + "=?",
+                        selectionArgs,
+                        null,
+                        null,
+                        null);
+        final int count;
+        if (cursor.moveToFirst()) {
+            count = cursor.getInt(0);
+        } else {
+            count = 0;
+        }
+        cursor.close();
+        return count;
+    }
+
+    public boolean containsSignedPreKey(Account account, int signedPreKeyId) {
+        Cursor cursor = getCursorForPreKey(account, signedPreKeyId);
+        int count = cursor.getCount();
+        cursor.close();
+        return count != 0;
+    }
+
+    public void storeSignedPreKey(Account account, SignedPreKeyRecord record) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        ContentValues values = new ContentValues();
+        values.put(SQLiteAxolotlStore.ID, record.getId());
+        values.put(
+                SQLiteAxolotlStore.KEY, Base64.encodeToString(record.serialize(), Base64.DEFAULT));
+        values.put(SQLiteAxolotlStore.ACCOUNT, account.getUuid());
+        db.insert(SQLiteAxolotlStore.SIGNED_PREKEY_TABLENAME, null, values);
+    }
+
+    public void deleteSignedPreKey(Account account, int signedPreKeyId) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        String[] args = {account.getUuid(), Integer.toString(signedPreKeyId)};
+        db.delete(
+                SQLiteAxolotlStore.SIGNED_PREKEY_TABLENAME,
+                SQLiteAxolotlStore.ACCOUNT + "=? AND " + SQLiteAxolotlStore.ID + "=?",
+                args);
+    }
+
+    // -----------------------------------------------------------------------
+    // Kyber prekey store (PQXDH / ML-KEM-1024)
+    // -----------------------------------------------------------------------
+
+    public KyberPreKeyRecord loadKyberPreKey(Account account, int kyberPreKeyId) {
+        SQLiteDatabase db = this.getReadableDatabase();
+        String[] columns = {SQLiteAxolotlStore.KEY};
+        String[] args = {account.getUuid(), Integer.toString(kyberPreKeyId)};
+        Cursor cursor = db.query(SQLiteAxolotlStore.KYBER_PREKEY_TABLENAME, columns,
+                SQLiteAxolotlStore.ACCOUNT + "=? AND " + SQLiteAxolotlStore.ID + "=?",
+                args, null, null, null);
+        KyberPreKeyRecord record = null;
+        if (cursor.moveToFirst()) {
+            try {
+                record = new KyberPreKeyRecord(Base64.decode(
+                        cursor.getString(cursor.getColumnIndexOrThrow(SQLiteAxolotlStore.KEY)),
+                        Base64.DEFAULT));
+            } catch (Exception e) {
+                Log.w(Config.LOGTAG, "Failed to load KyberPreKeyRecord: " + e.getMessage());
+            }
+        }
+        cursor.close();
+        return record;
+    }
+
+    public List<KyberPreKeyRecord> loadKyberPreKeys(Account account) {
+        SQLiteDatabase db = this.getReadableDatabase();
+        String[] columns = {SQLiteAxolotlStore.KEY};
+        String[] args = {account.getUuid()};
+        Cursor cursor = db.query(SQLiteAxolotlStore.KYBER_PREKEY_TABLENAME, columns,
+                SQLiteAxolotlStore.ACCOUNT + "=?", args, null, null, null);
+        List<KyberPreKeyRecord> records = new java.util.ArrayList<>();
+        while (cursor.moveToNext()) {
+            try {
+                records.add(new KyberPreKeyRecord(Base64.decode(
+                        cursor.getString(cursor.getColumnIndexOrThrow(SQLiteAxolotlStore.KEY)),
+                        Base64.DEFAULT)));
+            } catch (Exception e) {
+                Log.w(Config.LOGTAG, "Failed to load KyberPreKeyRecord: " + e.getMessage());
+            }
+        }
+        cursor.close();
+        return records;
+    }
+
+    public int loadKyberPreKeysCount(Account account) {
+        SQLiteDatabase db = this.getReadableDatabase();
+        String[] args = {account.getUuid()};
+        Cursor cursor = db.query(SQLiteAxolotlStore.KYBER_PREKEY_TABLENAME,
+                new String[]{"COUNT(*)"}, SQLiteAxolotlStore.ACCOUNT + "=?", args, null, null, null);
+        int count = 0;
+        if (cursor.moveToFirst()) count = cursor.getInt(0);
+        cursor.close();
+        return count;
+    }
+
+    /**
+     * The newest (highest-id) unconsumed one-time Kyber prekeys, up to {@code limit}.
+     * Used to build the published bundle from retained keys instead of regenerating
+     * a full batch on every publish.
+     */
+    public List<KyberPreKeyRecord> loadKyberOneTimePreKeys(Account account, int limit) {
+        SQLiteDatabase db = this.getReadableDatabase();
+        String[] columns = {SQLiteAxolotlStore.KEY};
+        String[] args = {account.getUuid()};
+        Cursor cursor = db.query(SQLiteAxolotlStore.KYBER_PREKEY_TABLENAME, columns,
+                SQLiteAxolotlStore.ACCOUNT + "=? AND " + SQLiteAxolotlStore.KYBER_IS_LAST_RESORT + "=0",
+                args, null, null, SQLiteAxolotlStore.ID + " DESC", Integer.toString(limit));
+        List<KyberPreKeyRecord> records = new java.util.ArrayList<>();
+        while (cursor.moveToNext()) {
+            try {
+                records.add(new KyberPreKeyRecord(Base64.decode(
+                        cursor.getString(cursor.getColumnIndexOrThrow(SQLiteAxolotlStore.KEY)),
+                        Base64.DEFAULT)));
+            } catch (Exception e) {
+                Log.w(Config.LOGTAG, "Failed to load KyberPreKeyRecord: " + e.getMessage());
+            }
+        }
+        cursor.close();
+        return records;
+    }
+
+    /** The most recently stored last-resort (signed) Kyber prekey, or null when none exists. */
+    public KyberPreKeyRecord loadLatestKyberLastResortPreKey(Account account) {
+        SQLiteDatabase db = this.getReadableDatabase();
+        String[] columns = {SQLiteAxolotlStore.KEY};
+        String[] args = {account.getUuid()};
+        Cursor cursor = db.query(SQLiteAxolotlStore.KYBER_PREKEY_TABLENAME, columns,
+                SQLiteAxolotlStore.ACCOUNT + "=? AND " + SQLiteAxolotlStore.KYBER_IS_LAST_RESORT + "=1",
+                args, null, null, SQLiteAxolotlStore.ID + " DESC", "1");
+        KyberPreKeyRecord record = null;
+        if (cursor.moveToFirst()) {
+            try {
+                record = new KyberPreKeyRecord(Base64.decode(
+                        cursor.getString(cursor.getColumnIndexOrThrow(SQLiteAxolotlStore.KEY)),
+                        Base64.DEFAULT));
+            } catch (Exception e) {
+                Log.w(Config.LOGTAG, "Failed to load KyberPreKeyRecord: " + e.getMessage());
+            }
+        }
+        cursor.close();
+        return record;
+    }
+
+    public void ensureKyberTablesExist() {
+        final SQLiteDatabase db = getWritableDatabase();
+        db.execSQL(CREATE_KYBER_PREKEYS_STATEMENT);
+        db.execSQL(CREATE_KYBER_LAST_RESORT_SESSIONS_STATEMENT);
+    }
+
+    public void ensureOmemo2PqTablesExist() {
+        getWritableDatabase().execSQL(CREATE_OMEMO2_PQ_IDENTITIES_STATEMENT);
+    }
+
+    private String loadOmemo2PqKey(final Account account, final String fingerprint) {
+        ensureOmemo2PqTablesExist();
+        final SQLiteDatabase db = getReadableDatabase();
+        final Cursor cursor = db.query(OMEMO2_PQ_IDENTITIES_TABLE,
+                new String[]{OMEMO2_PQ_KEY},
+                SQLiteAxolotlStore.ACCOUNT + "=? AND " + SQLiteAxolotlStore.FINGERPRINT + "=?",
+                new String[]{account.getUuid(), fingerprint}, null, null, null);
+        String value = null;
+        if (cursor.moveToFirst()) {
+            value = cursor.getString(0);
+        }
+        cursor.close();
+        return value;
+    }
+
+    private void storeOmemo2PqKey(final Account account, final String fingerprint, final byte[] bytes) {
+        ensureOmemo2PqTablesExist();
+        final SQLiteDatabase db = getWritableDatabase();
+        final ContentValues values = new ContentValues();
+        values.put(SQLiteAxolotlStore.ACCOUNT, account.getUuid());
+        values.put(SQLiteAxolotlStore.FINGERPRINT, fingerprint);
+        values.put(OMEMO2_PQ_KEY, Base64.encodeToString(bytes, Base64.NO_WRAP));
+        db.insertWithOnConflict(OMEMO2_PQ_IDENTITIES_TABLE, null, values,
+                SQLiteDatabase.CONFLICT_REPLACE);
+    }
+
+    /** This device's serialized ML-DSA-87 key pair, or null if not generated yet. */
+    public byte[] loadOwnOmemo2PqKeyPair(final Account account) {
+        final String value = loadOmemo2PqKey(account, OMEMO2_PQ_OWN_FINGERPRINT);
+        return value == null ? null : Base64.decode(value, Base64.NO_WRAP);
+    }
+
+    public void storeOwnOmemo2PqKeyPair(final Account account, final byte[] serialized) {
+        storeOmemo2PqKey(account, OMEMO2_PQ_OWN_FINGERPRINT, serialized);
+    }
+
+    /**
+     * The ML-DSA-87 public key pinned to {@code ikFingerprint} (a peer's classical
+     * identity-key fingerprint), or null if none is pinned yet.
+     */
+    public byte[] getPinnedOmemo2PqIdentity(final Account account, final String ikFingerprint) {
+        final String value = loadOmemo2PqKey(account, ikFingerprint);
+        return value == null ? null : Base64.decode(value, Base64.NO_WRAP);
+    }
+
+    public void pinOmemo2PqIdentity(final Account account, final String ikFingerprint, final byte[] pqIdentityKey) {
+        storeOmemo2PqKey(account, ikFingerprint, pqIdentityKey);
+    }
+
+    public void storeKyberPreKey(Account account, KyberPreKeyRecord record, boolean isLastResort) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        ContentValues values = new ContentValues();
+        values.put(SQLiteAxolotlStore.ID, record.getId());
+        values.put(SQLiteAxolotlStore.KEY, Base64.encodeToString(record.serialize(), Base64.DEFAULT));
+        values.put(SQLiteAxolotlStore.ACCOUNT, account.getUuid());
+        values.put(SQLiteAxolotlStore.KYBER_IS_LAST_RESORT, isLastResort ? 1 : 0);
+        db.insertWithOnConflict(SQLiteAxolotlStore.KYBER_PREKEY_TABLENAME, null, values,
+                SQLiteDatabase.CONFLICT_REPLACE);
+    }
+
+    public boolean isKyberPreKeyLastResort(Account account, int kyberPreKeyId) {
+        SQLiteDatabase db = this.getReadableDatabase();
+        String[] args = {account.getUuid(), Integer.toString(kyberPreKeyId)};
+        Cursor cursor = db.query(SQLiteAxolotlStore.KYBER_PREKEY_TABLENAME,
+                new String[]{SQLiteAxolotlStore.KYBER_IS_LAST_RESORT},
+                SQLiteAxolotlStore.ACCOUNT + "=? AND " + SQLiteAxolotlStore.ID + "=?",
+                args, null, null, null);
+        boolean lastResort = false;
+        if (cursor.moveToFirst()) {
+            lastResort = cursor.getInt(0) == 1;
+        }
+        cursor.close();
+        return lastResort;
+    }
+
+    public int countKyberOneTimePreKeys(Account account) {
+        SQLiteDatabase db = this.getReadableDatabase();
+        String[] args = {account.getUuid()};
+        Cursor cursor = db.query(SQLiteAxolotlStore.KYBER_PREKEY_TABLENAME,
+                new String[]{"COUNT(*)"},
+                SQLiteAxolotlStore.ACCOUNT + "=? AND "
+                        + SQLiteAxolotlStore.KYBER_IS_LAST_RESORT + "=0",
+                args, null, null, null);
+        int count = 0;
+        if (cursor.moveToFirst()) count = cursor.getInt(0);
+        cursor.close();
+        return count;
+    }
+
+    public boolean kyberLastResortSessionExists(Account account, int kemPreKeyId,
+            int signedPreKeyId, byte[] baseKey) {
+        SQLiteDatabase db = this.getReadableDatabase();
+        String[] args = {account.getUuid(), Integer.toString(kemPreKeyId),
+                Integer.toString(signedPreKeyId),
+                Base64.encodeToString(baseKey, Base64.NO_WRAP)};
+        Cursor cursor = db.query(SQLiteAxolotlStore.KYBER_LAST_RESORT_SESSIONS_TABLENAME,
+                new String[]{SQLiteAxolotlStore.KEM_PREKEY_ID},
+                SQLiteAxolotlStore.ACCOUNT + "=? AND "
+                        + SQLiteAxolotlStore.KEM_PREKEY_ID + "=? AND "
+                        + SQLiteAxolotlStore.SPK_ID + "=? AND "
+                        + SQLiteAxolotlStore.BASE_KEY + "=?",
+                args, null, null, null);
+        boolean exists = cursor.getCount() > 0;
+        cursor.close();
+        return exists;
+    }
+
+    public void recordKyberLastResortSession(Account account, int kemPreKeyId,
+            int signedPreKeyId, byte[] baseKey) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        ContentValues values = new ContentValues();
+        values.put(SQLiteAxolotlStore.ACCOUNT, account.getUuid());
+        values.put(SQLiteAxolotlStore.KEM_PREKEY_ID, kemPreKeyId);
+        values.put(SQLiteAxolotlStore.SPK_ID, signedPreKeyId);
+        values.put(SQLiteAxolotlStore.BASE_KEY, Base64.encodeToString(baseKey, Base64.NO_WRAP));
+        db.insertWithOnConflict(SQLiteAxolotlStore.KYBER_LAST_RESORT_SESSIONS_TABLENAME,
+                null, values, SQLiteDatabase.CONFLICT_IGNORE);
+    }
+
+    public boolean containsKyberPreKey(Account account, int kyberPreKeyId) {
+        SQLiteDatabase db = this.getReadableDatabase();
+        String[] args = {account.getUuid(), Integer.toString(kyberPreKeyId)};
+        Cursor cursor = db.query(SQLiteAxolotlStore.KYBER_PREKEY_TABLENAME,
+                new String[]{SQLiteAxolotlStore.ID},
+                SQLiteAxolotlStore.ACCOUNT + "=? AND " + SQLiteAxolotlStore.ID + "=?",
+                args, null, null, null);
+        boolean exists = cursor.getCount() > 0;
+        cursor.close();
+        return exists;
+    }
+
+    public void deleteKyberPreKey(Account account, int kyberPreKeyId) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        String[] args = {account.getUuid(), Integer.toString(kyberPreKeyId)};
+        db.delete(SQLiteAxolotlStore.KYBER_PREKEY_TABLENAME,
+                SQLiteAxolotlStore.ACCOUNT + "=? AND " + SQLiteAxolotlStore.ID + "=?", args);
+    }
+
+    // ----- Legacy OMEMO v0.3 raw byte accessors -----
+    // The legacy SignalProtocolStore (old libsignal package root) stores its
+    // SessionRecord / PreKeyRecord / SignedPreKeyRecord in serialized form
+    // here. We deliberately do not parse the bytes — the old library owns the
+    // format. Identities are NOT stored here; trust is per-IK and shared with
+    // the primary store.
+
+    public byte[] loadLegacySessionBytes(Account account, String name, int deviceId) {
+        SQLiteDatabase db = getReadableDatabase();
+        Cursor c = db.query("sessions",
+                new String[]{SQLiteAxolotlStore.KEY},
+                SQLiteAxolotlStore.ACCOUNT + "=? AND " + SQLiteAxolotlStore.NAME
+                        + "=? AND " + SQLiteAxolotlStore.DEVICE_ID + "=?",
+                new String[]{account.getUuid(), name, Integer.toString(deviceId)},
+                null, null, null);
+        byte[] bytes = null;
+        if (c.moveToFirst()) {
+            final String b64 = c.getString(0);
+            if (b64 != null) bytes = Base64.decode(b64, Base64.DEFAULT);
+        }
+        c.close();
+        return bytes;
+    }
+
+    public void storeLegacySessionBytes(Account account, String name, int deviceId, byte[] bytes) {
+        SQLiteDatabase db = getWritableDatabase();
+        ContentValues v = new ContentValues();
+        v.put(SQLiteAxolotlStore.ACCOUNT, account.getUuid());
+        v.put(SQLiteAxolotlStore.NAME, name);
+        v.put(SQLiteAxolotlStore.DEVICE_ID, deviceId);
+        v.put(SQLiteAxolotlStore.KEY, Base64.encodeToString(bytes, Base64.DEFAULT));
+        db.insertWithOnConflict("sessions", null, v, SQLiteDatabase.CONFLICT_REPLACE);
+    }
+
+    public boolean containsLegacySession(Account account, String name, int deviceId) {
+        SQLiteDatabase db = getReadableDatabase();
+        Cursor c = db.query("sessions", new String[]{"1"},
+                SQLiteAxolotlStore.ACCOUNT + "=? AND " + SQLiteAxolotlStore.NAME
+                        + "=? AND " + SQLiteAxolotlStore.DEVICE_ID + "=?",
+                new String[]{account.getUuid(), name, Integer.toString(deviceId)},
+                null, null, null);
+        boolean exists = c.getCount() > 0;
+        c.close();
+        return exists;
+    }
+
+    public List<Integer> getLegacySubDeviceSessions(Account account, String name) {
+        SQLiteDatabase db = getReadableDatabase();
+        Cursor c = db.query("sessions",
+                new String[]{SQLiteAxolotlStore.DEVICE_ID},
+                SQLiteAxolotlStore.ACCOUNT + "=? AND " + SQLiteAxolotlStore.NAME + "=?",
+                new String[]{account.getUuid(), name}, null, null, null);
+        final List<Integer> out = new ArrayList<>();
+        while (c.moveToNext()) out.add(c.getInt(0));
+        c.close();
+        return out;
+    }
+
+    public List<Integer> getOmemo2SubDeviceSessions(Account account, String name) {
+        SQLiteDatabase db = getReadableDatabase();
+        Cursor c = db.query(SQLiteAxolotlStore.SESSION_TABLENAME,
+                new String[]{SQLiteAxolotlStore.DEVICE_ID},
+                SQLiteAxolotlStore.ACCOUNT + "=? AND " + SQLiteAxolotlStore.NAME + "=?",
+                new String[]{account.getUuid(), name}, null, null, null);
+        final List<Integer> out = new ArrayList<>();
+        while (c.moveToNext()) out.add(c.getInt(0));
+        c.close();
+        return out;
+    }
+
+    public void deleteLegacySession(Account account, String name, int deviceId) {
+        SQLiteDatabase db = getWritableDatabase();
+        db.delete("sessions",
+                SQLiteAxolotlStore.ACCOUNT + "=? AND " + SQLiteAxolotlStore.NAME
+                        + "=? AND " + SQLiteAxolotlStore.DEVICE_ID + "=?",
+                new String[]{account.getUuid(), name, Integer.toString(deviceId)});
+    }
+
+    public void deleteAllLegacySessions(Account account, String name) {
+        SQLiteDatabase db = getWritableDatabase();
+        db.delete("sessions",
+                SQLiteAxolotlStore.ACCOUNT + "=? AND " + SQLiteAxolotlStore.NAME + "=?",
+                new String[]{account.getUuid(), name});
+    }
+
+    public byte[] loadLegacyPreKeyBytes(Account account, int id) {
+        SQLiteDatabase db = getReadableDatabase();
+        Cursor c = db.query("prekeys", new String[]{SQLiteAxolotlStore.KEY},
+                SQLiteAxolotlStore.ACCOUNT + "=? AND " + SQLiteAxolotlStore.ID + "=?",
+                new String[]{account.getUuid(), Integer.toString(id)}, null, null, null);
+        byte[] bytes = null;
+        if (c.moveToFirst()) {
+            final String b64 = c.getString(0);
+            if (b64 != null) bytes = Base64.decode(b64, Base64.DEFAULT);
+        }
+        c.close();
+        return bytes;
+    }
+
+    public void storeLegacyPreKeyBytes(Account account, int id, byte[] bytes) {
+        SQLiteDatabase db = getWritableDatabase();
+        ContentValues v = new ContentValues();
+        v.put(SQLiteAxolotlStore.ACCOUNT, account.getUuid());
+        v.put(SQLiteAxolotlStore.ID, id);
+        v.put(SQLiteAxolotlStore.KEY, Base64.encodeToString(bytes, Base64.DEFAULT));
+        db.insertWithOnConflict("prekeys", null, v, SQLiteDatabase.CONFLICT_REPLACE);
+    }
+
+    public boolean containsLegacyPreKey(Account account, int id) {
+        SQLiteDatabase db = getReadableDatabase();
+        Cursor c = db.query("prekeys", new String[]{"1"},
+                SQLiteAxolotlStore.ACCOUNT + "=? AND " + SQLiteAxolotlStore.ID + "=?",
+                new String[]{account.getUuid(), Integer.toString(id)},
+                null, null, null);
+        boolean exists = c.getCount() > 0;
+        c.close();
+        return exists;
+    }
+
+    public void deleteLegacyPreKey(Account account, int id) {
+        SQLiteDatabase db = getWritableDatabase();
+        db.delete("prekeys",
+                SQLiteAxolotlStore.ACCOUNT + "=? AND " + SQLiteAxolotlStore.ID + "=?",
+                new String[]{account.getUuid(), Integer.toString(id)});
+    }
+
+    public int countLegacyPreKeys(Account account) {
+        SQLiteDatabase db = getReadableDatabase();
+        Cursor c = db.rawQuery("SELECT COUNT(1) FROM prekeys WHERE "
+                + SQLiteAxolotlStore.ACCOUNT + "=?", new String[]{account.getUuid()});
+        int n = 0;
+        if (c.moveToFirst()) n = c.getInt(0);
+        c.close();
+        return n;
+    }
+
+    public byte[] loadLegacySignedPreKeyBytes(Account account, int id) {
+        SQLiteDatabase db = getReadableDatabase();
+        Cursor c = db.query("signed_prekeys",
+                new String[]{SQLiteAxolotlStore.KEY},
+                SQLiteAxolotlStore.ACCOUNT + "=? AND " + SQLiteAxolotlStore.ID + "=?",
+                new String[]{account.getUuid(), Integer.toString(id)}, null, null, null);
+        byte[] bytes = null;
+        if (c.moveToFirst()) {
+            final String b64 = c.getString(0);
+            if (b64 != null) bytes = Base64.decode(b64, Base64.DEFAULT);
+        }
+        c.close();
+        return bytes;
+    }
+
+    public List<byte[]> loadAllLegacySignedPreKeyBytes(Account account) {
+        SQLiteDatabase db = getReadableDatabase();
+        Cursor c = db.query("signed_prekeys",
+                new String[]{SQLiteAxolotlStore.KEY},
+                SQLiteAxolotlStore.ACCOUNT + "=?",
+                new String[]{account.getUuid()}, null, null, null);
+        final List<byte[]> out = new ArrayList<>();
+        while (c.moveToNext()) {
+            final String b64 = c.getString(0);
+            if (b64 != null) out.add(Base64.decode(b64, Base64.DEFAULT));
+        }
+        c.close();
+        return out;
+    }
+
+    public void storeLegacySignedPreKeyBytes(Account account, int id, byte[] bytes) {
+        SQLiteDatabase db = getWritableDatabase();
+        ContentValues v = new ContentValues();
+        v.put(SQLiteAxolotlStore.ACCOUNT, account.getUuid());
+        v.put(SQLiteAxolotlStore.ID, id);
+        v.put(SQLiteAxolotlStore.KEY, Base64.encodeToString(bytes, Base64.DEFAULT));
+        db.insertWithOnConflict("signed_prekeys", null, v, SQLiteDatabase.CONFLICT_REPLACE);
+    }
+
+    public boolean containsLegacySignedPreKey(Account account, int id) {
+        SQLiteDatabase db = getReadableDatabase();
+        Cursor c = db.query("signed_prekeys", new String[]{"1"},
+                SQLiteAxolotlStore.ACCOUNT + "=? AND " + SQLiteAxolotlStore.ID + "=?",
+                new String[]{account.getUuid(), Integer.toString(id)},
+                null, null, null);
+        boolean exists = c.getCount() > 0;
+        c.close();
+        return exists;
+    }
+
+    public void deleteLegacySignedPreKey(Account account, int id) {
+        SQLiteDatabase db = getWritableDatabase();
+        db.delete("signed_prekeys",
+                SQLiteAxolotlStore.ACCOUNT + "=? AND " + SQLiteAxolotlStore.ID + "=?",
+                new String[]{account.getUuid(), Integer.toString(id)});
+    }
+
+    private Cursor getIdentityKeyCursor(Account account, String name, boolean own) {
+        final SQLiteDatabase db = this.getReadableDatabase();
+        return getIdentityKeyCursor(db, account, name, own);
+    }
+
+    private Cursor getIdentityKeyCursor(
+            SQLiteDatabase db, Account account, String name, boolean own) {
+        return getIdentityKeyCursor(db, account, name, own, null);
+    }
+
+    private Cursor getIdentityKeyCursor(Account account, String fingerprint) {
+        final SQLiteDatabase db = this.getReadableDatabase();
+        return getIdentityKeyCursor(db, account, fingerprint);
+    }
+
+    private Cursor getIdentityKeyCursor(SQLiteDatabase db, Account account, String fingerprint) {
+        return getIdentityKeyCursor(db, account, null, null, fingerprint);
+    }
+
+    private Cursor getIdentityKeyCursor(
+            SQLiteDatabase db, Account account, String name, Boolean own, String fingerprint) {
+        String[] columns = {
+            SQLiteAxolotlStore.TRUST,
+            SQLiteAxolotlStore.ACTIVE,
+            SQLiteAxolotlStore.LAST_ACTIVATION,
+            SQLiteAxolotlStore.KEY
+        };
+        ArrayList<String> selectionArgs = new ArrayList<>(4);
+        selectionArgs.add(account.getUuid());
+        String selectionString = SQLiteAxolotlStore.ACCOUNT + " = ?";
+        if (name != null) {
+            selectionArgs.add(name);
+            selectionString += " AND " + SQLiteAxolotlStore.NAME + " = ?";
+        }
+        if (fingerprint != null) {
+            selectionArgs.add(fingerprint);
+            selectionString += " AND " + SQLiteAxolotlStore.FINGERPRINT + " = ?";
+        }
+        if (own != null) {
+            selectionArgs.add(own ? "1" : "0");
+            selectionString += " AND " + SQLiteAxolotlStore.OWN + " = ?";
+        }
+        Cursor cursor =
+                db.query(
+                        SQLiteAxolotlStore.IDENTITIES_TABLENAME,
+                        columns,
+                        selectionString,
+                        selectionArgs.toArray(new String[selectionArgs.size()]),
+                        null,
+                        null,
+                        null);
+
+        return cursor;
+    }
+
+    public IdentityKeyPair loadOwnIdentityKeyPair(Account account) {
+        SQLiteDatabase db = getReadableDatabase();
+        return loadOwnIdentityKeyPair(db, account);
+    }
+
+    private IdentityKeyPair loadOwnIdentityKeyPair(SQLiteDatabase db, Account account) {
+        String name = account.getJid().asBareJid().toString();
+        return loadOwnIdentityKeyPair(db, account, name);
+    }
+
+    // Sentinel <name> under which the PQ OMEMO2 stack stores its OWN identity key.
+    // PQ OMEMO2 must have a different fingerprint from legacy OMEMO (strict stack
+    // separation, no cross-stack trust bleed). The legacy stack keeps the original
+    // own-key row (name = bareJid), so we cannot reuse that name here. The control
+    // character makes this name impossible to collide with a real JID (contact or
+    // own) so it never leaks into contact key lookups, which filter on own=0.
+    public static String omemo2OwnIdentityKeyName(final Account account) {
+        return account.getJid().asBareJid().toString() + "\0omemo2-own"; // "\0" = NUL: impossible in a real JID (a raw 0x00 byte here made tools treat this file as binary)
+    }
+
+    /**
+     * Load the PQ OMEMO2 stack's OWN identity key pair (stored under the
+     * {@link #omemo2OwnIdentityKeyName(Account)} sentinel). Returns null when it
+     * has not been generated yet (fresh install or first run after the
+     * shared-key → separate-key migration), which is the signal to re-key.
+     */
+    public IdentityKeyPair loadOwnOmemo2IdentityKeyPair(Account account) {
+        SQLiteDatabase db = getReadableDatabase();
+        return loadOwnIdentityKeyPair(db, account, omemo2OwnIdentityKeyName(account));
+    }
+
+    private IdentityKeyPair loadOwnIdentityKeyPair(SQLiteDatabase db, Account account, String name) {
+        IdentityKeyPair identityKeyPair = null;
+        Cursor cursor = getIdentityKeyCursor(db, account, name, true);
+        if (cursor.getCount() != 0) {
+            cursor.moveToFirst();
+            try {
+                identityKeyPair =
+                        new IdentityKeyPair(
+                                Base64.decode(
+                                        cursor.getString(
+                                                cursor.getColumnIndex(SQLiteAxolotlStore.KEY)),
+                                        Base64.DEFAULT));
+            } catch (InvalidKeyException e) {
+                Log.d(
+                        Config.LOGTAG,
+                        AxolotlService.getLogprefix(account)
+                                + "Encountered invalid IdentityKey in database for account"
+                                + account.getJid().asBareJid()
+                                + ", address: "
+                                + name);
+            }
+        }
+        cursor.close();
+
+        return identityKeyPair;
+    }
+
+    public Set<IdentityKey> loadIdentityKeys(Account account, String name) {
+        return loadIdentityKeys(account, name, null);
+    }
+
+    public Set<IdentityKey> loadIdentityKeys(
+            Account account, String name, FingerprintStatus status) {
+        Set<IdentityKey> identityKeys = new HashSet<>();
+        Cursor cursor = getIdentityKeyCursor(account, name, false);
+
+        while (cursor.moveToNext()) {
+            if (status != null && !FingerprintStatus.fromCursor(cursor).equals(status)) {
+                continue;
+            }
+            try {
+                String key = cursor.getString(cursor.getColumnIndex(SQLiteAxolotlStore.KEY));
+                if (key != null) {
+                    identityKeys.add(new IdentityKey(Base64.decode(key, Base64.DEFAULT), 0));
+                } else {
+                    Log.d(
+                            Config.LOGTAG,
+                            AxolotlService.getLogprefix(account)
+                                    + "Missing key (possibly preverified) in database for account"
+                                    + account.getJid().asBareJid()
+                                    + ", address: "
+                                    + name);
+                }
+            } catch (InvalidKeyException e) {
+                Log.d(
+                        Config.LOGTAG,
+                        AxolotlService.getLogprefix(account)
+                                + "Encountered invalid IdentityKey in database for account"
+                                + account.getJid().asBareJid()
+                                + ", address: "
+                                + name);
+            }
+        }
+        cursor.close();
+
+        return identityKeys;
+    }
+
+    public long numTrustedKeys(Account account, String name) {
+        SQLiteDatabase db = getReadableDatabase();
+        String[] args = {
+            account.getUuid(),
+            name,
+            FingerprintStatus.Trust.TRUSTED.toString(),
+            FingerprintStatus.Trust.VERIFIED.toString(),
+            FingerprintStatus.Trust.VERIFIED_X509.toString()
+        };
+        try (Cursor cursor = db.rawQuery("SELECT count(*) FROM " + SQLiteAxolotlStore.IDENTITIES_TABLENAME + " WHERE " + SQLiteAxolotlStore.ACCOUNT + " = ? AND " + SQLiteAxolotlStore.NAME + " = ? AND (" + SQLiteAxolotlStore.TRUST + " = ? OR " + SQLiteAxolotlStore.TRUST + " = ? OR " + SQLiteAxolotlStore.TRUST + " = ?) AND " + SQLiteAxolotlStore.ACTIVE + " > 0", args)) {
+            if (cursor.moveToFirst()) {
+                return cursor.getLong(0);
+            }
+        }
+        return 0;
+    }
+
+    private void storeIdentityKey(
+            Account account,
+            String name,
+            boolean own,
+            String fingerprint,
+            String base64Serialized,
+            FingerprintStatus status) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        ContentValues values = new ContentValues();
+        values.put(SQLiteAxolotlStore.ACCOUNT, account.getUuid());
+        values.put(SQLiteAxolotlStore.NAME, name);
+        values.put(SQLiteAxolotlStore.OWN, own ? 1 : 0);
+        values.put(SQLiteAxolotlStore.FINGERPRINT, fingerprint);
+        values.put(SQLiteAxolotlStore.KEY, base64Serialized);
+        values.putAll(status.toContentValues());
+        String where =
+                SQLiteAxolotlStore.ACCOUNT
+                        + "=? AND "
+                        + SQLiteAxolotlStore.NAME
+                        + "=? AND "
+                        + SQLiteAxolotlStore.FINGERPRINT
+                        + " =?";
+        String[] whereArgs = {account.getUuid(), name, fingerprint};
+        int rows = db.update(SQLiteAxolotlStore.IDENTITIES_TABLENAME, values, where, whereArgs);
+        if (rows == 0) {
+            db.insert(SQLiteAxolotlStore.IDENTITIES_TABLENAME, null, values);
+        }
+    }
+
+    public void storePreVerification(
+            Account account, String name, String fingerprint, FingerprintStatus status) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        ContentValues values = new ContentValues();
+        values.put(SQLiteAxolotlStore.ACCOUNT, account.getUuid());
+        values.put(SQLiteAxolotlStore.NAME, name);
+        values.put(SQLiteAxolotlStore.OWN, 0);
+        values.put(SQLiteAxolotlStore.FINGERPRINT, fingerprint);
+        values.putAll(status.toContentValues());
+        db.insert(SQLiteAxolotlStore.IDENTITIES_TABLENAME, null, values);
+    }
+
+    public FingerprintStatus getFingerprintStatus(Account account, String fingerprint) {
+        Cursor cursor = getIdentityKeyCursor(account, fingerprint);
+        final FingerprintStatus status;
+        if (cursor.getCount() > 0) {
+            cursor.moveToFirst();
+            status = FingerprintStatus.fromCursor(cursor);
+        } else {
+            status = null;
+        }
+        cursor.close();
+        return status;
+    }
+
+    public boolean setIdentityKeyTrust(
+            Account account, String fingerprint, FingerprintStatus fingerprintStatus) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        return setIdentityKeyTrust(db, account, fingerprint, fingerprintStatus);
+    }
+
+    private boolean setIdentityKeyTrust(
+            SQLiteDatabase db, Account account, String fingerprint, FingerprintStatus status) {
+        String[] selectionArgs = {account.getUuid(), fingerprint};
+        int rows =
+                db.update(
+                        SQLiteAxolotlStore.IDENTITIES_TABLENAME,
+                        status.toContentValues(),
+                        SQLiteAxolotlStore.ACCOUNT
+                                + " = ? AND "
+                                + SQLiteAxolotlStore.FINGERPRINT
+                                + " = ? ",
+                        selectionArgs);
+        return rows == 1;
+    }
+
+    public boolean setIdentityKeyCertificate(
+            Account account, String fingerprint, X509Certificate x509Certificate) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        String[] selectionArgs = {account.getUuid(), fingerprint};
+        try {
+            ContentValues values = new ContentValues();
+            values.put(SQLiteAxolotlStore.CERTIFICATE, x509Certificate.getEncoded());
+            return db.update(
+                            SQLiteAxolotlStore.IDENTITIES_TABLENAME,
+                            values,
+                            SQLiteAxolotlStore.ACCOUNT
+                                    + " = ? AND "
+                                    + SQLiteAxolotlStore.FINGERPRINT
+                                    + " = ? ",
+                            selectionArgs)
+                    == 1;
+        } catch (CertificateEncodingException e) {
+            Log.d(Config.LOGTAG, "could not encode certificate");
+            return false;
+        }
+    }
+
+    public X509Certificate getIdentityKeyCertifcate(Account account, String fingerprint) {
+        SQLiteDatabase db = this.getReadableDatabase();
+        String[] selectionArgs = {account.getUuid(), fingerprint};
+        String[] colums = {SQLiteAxolotlStore.CERTIFICATE};
+        String selection =
+                SQLiteAxolotlStore.ACCOUNT + " = ? AND " + SQLiteAxolotlStore.FINGERPRINT + " = ? ";
+        Cursor cursor =
+                db.query(
+                        SQLiteAxolotlStore.IDENTITIES_TABLENAME,
+                        colums,
+                        selection,
+                        selectionArgs,
+                        null,
+                        null,
+                        null);
+        if (cursor.getCount() < 1) {
+            return null;
+        } else {
+            cursor.moveToFirst();
+            byte[] certificate =
+                    cursor.getBlob(cursor.getColumnIndex(SQLiteAxolotlStore.CERTIFICATE));
+            cursor.close();
+            if (certificate == null || certificate.length == 0) {
+                return null;
+            }
+            try {
+                CertificateFactory certificateFactory = CertificateFactory.getInstance("X.509");
+                return (X509Certificate)
+                        certificateFactory.generateCertificate(
+                                new ByteArrayInputStream(certificate));
+            } catch (CertificateException e) {
+                Log.d(Config.LOGTAG, "certificate exception " + e.getMessage());
+                return null;
+            }
+        }
+    }
+
+    public void storeIdentityKey(
+            Account account, String name, IdentityKey identityKey, FingerprintStatus status) {
+        storeIdentityKey(
+                account,
+                name,
+                false,
+                CryptoHelper.bytesToHex(identityKey.getPublicKey().serialize()),
+                Base64.encodeToString(identityKey.serialize(), Base64.DEFAULT),
+                status);
+    }
+
+    public void storeOwnIdentityKeyPair(Account account, IdentityKeyPair identityKeyPair) {
+        storeIdentityKey(
+                account,
+                account.getJid().asBareJid().toString(),
+                true,
+                CryptoHelper.bytesToHex(identityKeyPair.getPublicKey().serialize()),
+                Base64.encodeToString(identityKeyPair.serialize(), Base64.DEFAULT),
+                FingerprintStatus.createActiveVerified(false));
+    }
+
+    public void storeOwnOmemo2IdentityKeyPair(Account account, IdentityKeyPair identityKeyPair) {
+        storeIdentityKey(
+                account,
+                omemo2OwnIdentityKeyName(account),
+                true,
+                CryptoHelper.bytesToHex(identityKeyPair.getPublicKey().serialize()),
+                Base64.encodeToString(identityKeyPair.serialize(), Base64.DEFAULT),
+                FingerprintStatus.createActiveVerified(false));
+    }
+
+    private void recreateAxolotlDb(SQLiteDatabase db) {
+        Log.d(
+                Config.LOGTAG,
+                AxolotlService.LOGPREFIX + " : " + ">>> (RE)CREATING AXOLOTL DATABASE <<<");
+        db.execSQL("DROP TABLE IF EXISTS " + SQLiteAxolotlStore.SESSION_TABLENAME);
+        db.execSQL(CREATE_SESSIONS_STATEMENT);
+        db.execSQL("DROP TABLE IF EXISTS " + SQLiteAxolotlStore.PREKEY_TABLENAME);
+        db.execSQL(CREATE_PREKEYS_STATEMENT);
+        db.execSQL("DROP TABLE IF EXISTS " + SQLiteAxolotlStore.SIGNED_PREKEY_TABLENAME);
+        db.execSQL(CREATE_SIGNED_PREKEYS_STATEMENT);
+        db.execSQL("DROP TABLE IF EXISTS " + SQLiteAxolotlStore.IDENTITIES_TABLENAME);
+        db.execSQL(CREATE_IDENTITIES_STATEMENT);
+    }
+
+    public void wipeAxolotlDb(Account account) {
+        String accountName = account.getUuid();
+        Log.d(
+                Config.LOGTAG,
+                AxolotlService.getLogprefix(account)
+                        + ">>> WIPING AXOLOTL DATABASE FOR ACCOUNT "
+                        + accountName
+                        + " <<<");
+        SQLiteDatabase db = this.getWritableDatabase();
+        String[] deleteArgs = {accountName};
+        db.delete(
+                SQLiteAxolotlStore.SESSION_TABLENAME,
+                SQLiteAxolotlStore.ACCOUNT + " = ?",
+                deleteArgs);
+        db.delete(
+                SQLiteAxolotlStore.PREKEY_TABLENAME,
+                SQLiteAxolotlStore.ACCOUNT + " = ?",
+                deleteArgs);
+        db.delete(
+                SQLiteAxolotlStore.SIGNED_PREKEY_TABLENAME,
+                SQLiteAxolotlStore.ACCOUNT + " = ?",
+                deleteArgs);
+        db.delete(
+                SQLiteAxolotlStore.KYBER_PREKEY_TABLENAME,
+                SQLiteAxolotlStore.ACCOUNT + " = ?",
+                deleteArgs);
+        db.delete(
+                SQLiteAxolotlStore.KYBER_LAST_RESORT_SESSIONS_TABLENAME,
+                SQLiteAxolotlStore.ACCOUNT + " = ?",
+                deleteArgs);
+        db.delete(
+                SQLiteAxolotlStore.IDENTITIES_TABLENAME,
+                SQLiteAxolotlStore.ACCOUNT + " = ?",
+                deleteArgs);
+        // Also wipe the LEGACY OMEMO (XEP-0384 v0.3) own state. These tables are legacy-only
+        // (OMEMO2 uses the omemo2_*-prefixed names). Without this, the legacy session rows survive a
+        // key reset, so AxolotlService.findDevicesWithoutSession() takes its legacy.hasSession()
+        // shortcut and never re-fetches a contact's bundle — leaving the wiped identities/fingerprints
+        // (and trust) unrecoverable, so legacy contacts become unreachable after a reset. Wiping the
+        // legacy prekeys/signed prekeys too lets publishBundlesIfNeeded() re-sign the republished
+        // legacy bundle under the new identity.
+        db.delete("sessions", SQLiteAxolotlStore.ACCOUNT + " = ?", deleteArgs);
+        db.delete("prekeys", SQLiteAxolotlStore.ACCOUNT + " = ?", deleteArgs);
+        db.delete("signed_prekeys", SQLiteAxolotlStore.ACCOUNT + " = ?", deleteArgs);
+        // Also wipe the PQ OMEMO2 identity table: the OWN ML-DSA-87 key pair row
+        // (this is a full "last resort" identity reset — a possibly compromised
+        // post-quantum identity half must not survive it; a fresh one is generated
+        // on the next getOwnPqIdentityKeyPair call) and the peers' pinned pq_ik
+        // rows (their classical counterparts in the identities table were just
+        // erased above; leaving the pq pins would keep half the trust state and
+        // recreate the stale pin-without-identity-row situation). Peers simply
+        // re-pin via TOFU on the next bundle fetch.
+        ensureOmemo2PqTablesExist();
+        db.delete(OMEMO2_PQ_IDENTITIES_TABLE, SQLiteAxolotlStore.ACCOUNT + " = ?", deleteArgs);
+    }
+
+    /**
+     * Wipe ONLY the PQ OMEMO2 stack's own key material — sessions, EC prekeys, EC
+     * signed prekeys and the Kyber (KEM) prekeys / last-resort replay records — for
+     * {@code account}. Used when re-keying the OMEMO2 identity (legacy → PQ
+     * separation): the freshly generated identity key must re-sign all published
+     * key material (proto-XEP §4.4.1/§6.2), so the stale material has to go.
+     *
+     * <p>Deliberately leaves the shared {@code identities} table untouched so the
+     * user's verified contact fingerprints (legacy AND OMEMO2) survive, and never
+     * touches the {@code legacy_*} tables so the legacy stack keeps its original
+     * identity and sessions. Contrast {@link #wipeAxolotlDb(Account)}, which also
+     * clears identities and would erase all contact trust.
+     */
+    public void wipeOmemo2OwnKeyMaterial(Account account) {
+        final String accountName = account.getUuid();
+        Log.d(
+                Config.LOGTAG,
+                AxolotlService.getLogprefix(account)
+                        + ">>> WIPING OMEMO2 OWN KEY MATERIAL (re-key) FOR ACCOUNT "
+                        + accountName
+                        + " <<<");
+        final SQLiteDatabase db = this.getWritableDatabase();
+        final String[] deleteArgs = {accountName};
+        for (final String table : new String[] {
+                SQLiteAxolotlStore.SESSION_TABLENAME,
+                SQLiteAxolotlStore.PREKEY_TABLENAME,
+                SQLiteAxolotlStore.SIGNED_PREKEY_TABLENAME,
+                SQLiteAxolotlStore.KYBER_PREKEY_TABLENAME,
+                SQLiteAxolotlStore.KYBER_LAST_RESORT_SESSIONS_TABLENAME}) {
+            db.delete(table, SQLiteAxolotlStore.ACCOUNT + " = ?", deleteArgs);
+        }
+        // Drop only OUR post-quantum identity key pair (the "self" row) so the
+        // hybrid identity re-keys together with the classical OMEMO2 key; leave
+        // peers' pinned pq_ik rows intact (they are contact trust, like the
+        // identities table).
+        ensureOmemo2PqTablesExist();
+        db.delete(OMEMO2_PQ_IDENTITIES_TABLE,
+                SQLiteAxolotlStore.ACCOUNT + " = ? AND " + SQLiteAxolotlStore.FINGERPRINT + " = ?",
+                new String[]{accountName, OMEMO2_PQ_OWN_FINGERPRINT});
+    }
+
+    public List<ShortcutService.FrequentContact> getFrequentContacts(final int days) {
+        final var db = this.getReadableDatabase();
+        final String SQL =
+                "select "
+                        + Conversation.TABLENAME
+                        + "."
+                        + Conversation.UUID
+                        + ","
+                        + Conversation.TABLENAME
+                        + "."
+                        + Conversation.ACCOUNT
+                        + ","
+                        + Conversation.TABLENAME
+                        + "."
+                        + Conversation.CONTACTJID
+                        + " from "
+                        + Conversation.TABLENAME
+                        + " join "
+                        + Message.TABLENAME
+                        + " on conversations.uuid=messages.conversationUuid where"
+                        + " messages.status!=0 and carbon==0  and conversations.mode=0 and"
+                        + " messages.timeSent>=? group by conversations.uuid order by count(body)"
+                        + " desc limit 4;";
+        String[] whereArgs =
+                new String[] {
+                    String.valueOf(System.currentTimeMillis() - (Config.MILLISECONDS_IN_DAY * days))
+                };
+        Cursor cursor = db.rawQuery(SQL, whereArgs);
+        ArrayList<ShortcutService.FrequentContact> contacts = new ArrayList<>();
+        while (cursor.moveToNext()) {
+            try {
+                contacts.add(
+                        new ShortcutService.FrequentContact(
+                                cursor.getString(0),
+                                cursor.getString(1),
+                                Jid.of(cursor.getString(2))));
+            } catch (final Exception e) {
+                Log.e(Config.LOGTAG, "could not create frequent contact", e);
+            }
+        }
+        cursor.close();
+        return contacts;
+    }
+
+    public Map<Integer, Integer> getMessagesCountGroupByDay(String conversationUuid, int year, int month) {
+        final var db = this.getReadableDatabase();
+
+        Map<Integer, Integer> messagesPerDay = new HashMap<>();
+
+        // Calculate the start and end timestamps for the given month
+        Calendar calendar = Calendar.getInstance();
+        calendar.set(year, month - 1, 1, 0, 0, 0); // Month is 0-indexed in Calendar
+        calendar.set(Calendar.MILLISECOND, 0);
+        long startTimeMillis = calendar.getTimeInMillis();
+
+        calendar.add(Calendar.MONTH, 1);
+        calendar.add(Calendar.MILLISECOND, -1);
+        long endTimeMillis = calendar.getTimeInMillis();
+
+        long offset = TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 1000;
+
+        String sql = "SELECT " +
+                "CAST(strftime('%d', " + Message.TIME_SENT + " / 1000 + " + offset +", 'unixepoch') AS INTEGER) AS day_of_month, " +
+                "COUNT(" + Message.UUID + ") AS message_count " +
+                "FROM " + Message.TABLENAME + " " +
+                "WHERE " + Message.CONVERSATION + " = ? " +
+                "AND " + Message.TIME_SENT + " >= ? " +
+                "AND " + Message.TIME_SENT + " <= ? " +
+                "AND " + Message.DELETED + " = 0 " +
+                "GROUP BY day_of_month " +
+                "ORDER BY day_of_month ASC;";
+
+        String[] selectionArgs = {
+                conversationUuid,
+                String.valueOf(startTimeMillis),
+                String.valueOf(endTimeMillis)
+        };
+
+        Cursor cursor = db.rawQuery(sql, selectionArgs);
+
+        if (cursor != null) {
+            try {
+                int dayOfMonthIndex = cursor.getColumnIndex("day_of_month");
+                int messageCountIndex = cursor.getColumnIndex("message_count");
+
+                if (dayOfMonthIndex != -1 && messageCountIndex != -1) {
+                    while (cursor.moveToNext()) {
+                        int day = cursor.getInt(dayOfMonthIndex);
+                        int count = cursor.getInt(messageCountIndex);
+                        messagesPerDay.put(day, count);
+                    }
+                }
+            } finally {
+                cursor.close();
+            }
+        }
+        return messagesPerDay;
+    }
+
+    public Iterable<Message> getMessagesIterable(final Conversation conversation) {
+        return () -> new Iterator<Message>() {
+            @Override
+            public boolean hasNext() {
+                if (messageCursor == null) return false;
+                return !messageCursor.isAfterLast();
+            }
+
+            final SQLiteDatabase database = getReadableDatabase();
+            final String[] queryArgs = {conversation.getUuid(), "1"};
+            Cursor messageCursor = null;
+
+            {
+                messageCursor = database.query(Message.TABLENAME, null, Message.CONVERSATION
+                        + "=? and " + Message.DELETED + "<?", queryArgs, null, null, Message.TIME_SENT
+                        + " ASC", null);
+                if (messageCursor != null) {
+                    messageCursor.moveToFirst();
+                }
+            }
+
+            @Override
+            public Message next() {
+                if (messageCursor == null || messageCursor.isAfterLast()) {
+                    throw new NoSuchElementException();
+                }
+                Message message = null;
+                try {
+                    message = Message.fromCursor(messageCursor, conversation);
+                } catch (IOException e) {
+                    messageCursor.close();
+                    throw new RuntimeException(e);
+                }
+                messageCursor.moveToNext();
+                return message;
+            }
+
+            @Override
+            public void remove() {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            protected void finalize() throws Throwable {
+                if (messageCursor != null) {
+                    messageCursor.close();
+                }
+                if (database != null) {
+                    database.close();
+                }
+                super.finalize();
+            }
+        };
+    }
+
+    // New helper method that accepts an existing database connection
+    public Conversation findConversationByUuid(final String uuid, final SQLiteDatabase db) {
+        final String[] selectionArgs = {uuid};
+        try (final Cursor cursor =
+                     db.query(
+                             Conversation.TABLENAME,
+                             null,
+                             Conversation.UUID + "=?",
+                             selectionArgs,
+                             null,
+                             null,
+                             null)) {
+            if (!cursor.moveToFirst()) {
+                return null;
+            }
+            final Conversation conversation = Conversation.fromCursor(cursor);
+            if (conversation.getJid() instanceof Jid.Invalid) {
+                return null;
+            }
+            return conversation;
+        }
+    }
+
+    public ArrayList<Message> getMessages(Conversation conversation, int type, int limit) {
+        ArrayList<Message> list = new ArrayList<>();
+        SQLiteDatabase db = this.getReadableDatabase();
+        Cursor cursor = db.query(Message.TABLENAME,
+                null,
+                Message.CONVERSATION + "=? AND " + Message.TYPE + "=?",
+                new String[]{conversation.getUuid(), String.valueOf(type)},
+                null,
+                null,
+                Message.TIME_SENT + " DESC",
+                String.valueOf(limit));
+        if (cursor.getCount() > 0) {
+            cursor.moveToFirst();
+            do {
+                try {
+                    list.add(Message.fromCursor(cursor, conversation));
+                } catch (final Exception e) {
+                    Log.d(Config.LOGTAG,"unable to load message from database",e);
+                }
+            } while (cursor.moveToNext());
+        }
+        cursor.close();
+        return list;
+    }
+
+    public void createPost(eu.siacs.conversations.entities.Post post, eu.siacs.conversations.entities.Account account) {
+        final SQLiteDatabase db = this.getWritableDatabase();
+        db.insertWithOnConflict(eu.siacs.conversations.entities.Post.TABLENAME, null, post.getContentValues(account), SQLiteDatabase.CONFLICT_REPLACE);
+    }
+
+    public java.util.List<eu.siacs.conversations.entities.Post> getPosts() {
+        final java.util.List<eu.siacs.conversations.entities.Post> list = new java.util.ArrayList<>();
+        final SQLiteDatabase db = this.getReadableDatabase();
+        Cursor cursor = db.query(eu.siacs.conversations.entities.Post.TABLENAME, null, null, null, null, null, eu.siacs.conversations.entities.Post.PUBLISHED + " DESC");
+        while (cursor.moveToNext()) {
+            list.add(eu.siacs.conversations.entities.Post.fromCursor(cursor));
+        }
+        cursor.close();
+        return list;
+    }
+
+    public void deletePost(String uuid) {
+        final SQLiteDatabase db = this.getWritableDatabase();
+        db.delete(eu.siacs.conversations.entities.Post.TABLENAME, eu.siacs.conversations.entities.Post.UUID + "=?", new String[]{uuid});
+    }
+
+    public void clearPosts() {
+        final SQLiteDatabase db = this.getWritableDatabase();
+        db.delete(eu.siacs.conversations.entities.Post.TABLENAME, null, null);
+    }
+
+    public void upsertStory(eu.siacs.conversations.entities.Story story) {
+        final SQLiteDatabase db = this.getWritableDatabase();
+        db.insertWithOnConflict(eu.siacs.conversations.entities.Story.TABLENAME, null, story.getContentValues(), SQLiteDatabase.CONFLICT_REPLACE);
+    }
+
+    public java.util.List<eu.siacs.conversations.entities.Story> getStoriesFromDatabase() {
+        final java.util.List<eu.siacs.conversations.entities.Story> list = new java.util.ArrayList<>();
+        final SQLiteDatabase db = this.getReadableDatabase();
+        final long twentyFourHoursAgo = System.currentTimeMillis() - 86400000L;
+        final Cursor cursor = db.query(
+                eu.siacs.conversations.entities.Story.TABLENAME,
+                null,
+                eu.siacs.conversations.entities.Story.PUBLISHED + " >= ?",
+                new String[]{String.valueOf(twentyFourHoursAgo)},
+                null, null,
+                eu.siacs.conversations.entities.Story.PUBLISHED + " DESC");
+        while (cursor.moveToNext()) {
+            try {
+                list.add(eu.siacs.conversations.entities.Story.fromCursor(cursor));
+            } catch (Exception e) {
+                Log.w(Config.LOGTAG, "Failed to restore story from database", e);
+            }
+        }
+        cursor.close();
+        return list;
+    }
+
+    public void deleteStory(String uuid) {
+        final SQLiteDatabase db = this.getWritableDatabase();
+        db.delete(eu.siacs.conversations.entities.Story.TABLENAME,
+                eu.siacs.conversations.entities.Story.UUID + "=?",
+                new String[]{uuid});
+    }
+
+    public void deleteExpiredStories() {
+        final SQLiteDatabase db = this.getWritableDatabase();
+        final long twentyFourHoursAgo = System.currentTimeMillis() - 86400000L;
+        db.delete(eu.siacs.conversations.entities.Story.TABLENAME,
+                eu.siacs.conversations.entities.Story.PUBLISHED + " < ?",
+                new String[]{String.valueOf(twentyFourHoursAgo)});
+    }
+
+    /**
+     * Re-encrypts the database with a new password (Argon2id mode) or reverts to auto-encryption
+     * with a fresh random key (auto mode when {@code newPassword} is null).
+     *
+     * <ul>
+     *   <li>{@code oldPassword null}: old DB is auto-encrypted — auto key is read from storage.
+     *   <li>{@code newPassword null}: new DB uses auto-encryption — a fresh random key is generated.
+     *   <li>Both non-null: password change (Argon2id to Argon2id).
+     * </ul>
+     *
+     * <p>File operations are crash-safe: a sentinel flag is set before any file is moved, and
+     * {@link #recoverFromInterruptedMigration} restores a consistent state on the next launch.
+     * New key material is kept in memory and written to persistent storage only AFTER the file
+     * rename succeeds, ensuring the stored key always matches the DB file on disk.
+     */
+    public static synchronized void migrate(Context context, char[] oldPassword, char[] newPassword) throws Exception {
+        System.loadLibrary("sqlcipher");
+        final AppSettings settings = new AppSettings(context);
+        final File dbFile = context.getDatabasePath(DATABASE_NAME);
+
+        // Generate new key material entirely in memory. It is persisted only AFTER the DB file
+        // rename succeeds (crash-safety: if we crash before persisting, recovery opens the
+        // backup with the OLD key and restores a consistent state).
+        final byte[] newSalt;
+        final byte[] newAutoKey;
+        final byte[] newRawKey;
+        if (newPassword != null) {
+            newSalt = eu.siacs.conversations.Argon2KeyDerivation.INSTANCE.generateSalt();
+            newAutoKey = null;
+            newRawKey = eu.siacs.conversations.Argon2KeyDerivation.INSTANCE
+                    .deriveRawKeyBytes(newPassword, newSalt);
+        } else {
+            newSalt = null;
+            newAutoKey = eu.siacs.conversations.Argon2KeyDerivation.INSTANCE.generateRandomKey();
+            newRawKey = eu.siacs.conversations.Argon2KeyDerivation.INSTANCE
+                    .deriveAutoRawKeyBytes(newAutoKey);
+        }
+
+        try {
+            if (!dbFile.exists()) {
+                persistNewKeyState(settings, newPassword, newSalt, newAutoKey);
+                closeInstance();
+                return;
+            }
+
+            final File tempFile = context.getDatabasePath(DATABASE_NAME + ".tmp");
+            if (tempFile.exists() && !tempFile.delete()) {
+                throw new java.io.IOException("Failed to delete existing temporary database file");
+            }
+            if (tempFile.getParentFile() != null
+                    && !tempFile.getParentFile().exists()
+                    && !tempFile.getParentFile().mkdirs()) {
+                throw new java.io.IOException("Failed to create database directory");
+            }
+            if (!tempFile.createNewFile()) {
+                throw new java.io.IOException("Failed to create temporary database file");
+            }
+
+            // Derive the OLD key. We cannot call getKeyBytes() here because it reads the current
+            // KDF state from prefs, which still reflects the OLD state.
+            final byte[] oldRawKey;
+            if (settings.isArgon2idKdf()) {
+                if (oldPassword == null) {
+                    throw new eu.siacs.conversations.EncryptionException(
+                            "Old password required to open Argon2id-encrypted database", null,
+                            eu.siacs.conversations.EncryptionException.Reason.NEEDS_SESSION_PASSWORD);
+                }
+                final byte[] oldSalt = settings.getArgon2Salt();
+                if (oldSalt == null) {
+                    throw new eu.siacs.conversations.EncryptionException(
+                            "Cannot open old Argon2id DB: salt missing", null,
+                            eu.siacs.conversations.EncryptionException.Reason.KEYSTORE_ERROR);
+                }
+                oldRawKey = eu.siacs.conversations.Argon2KeyDerivation.INSTANCE
+                        .deriveRawKeyBytes(oldPassword, oldSalt);
+            } else {
+                // Auto mode: read the stored auto key — never generate here to avoid overwriting.
+                final byte[] storedAutoKey =
+                        new eu.siacs.conversations.SecurePasswordStorage(context).readAutoKey();
+                if (storedAutoKey == null) {
+                    throw new eu.siacs.conversations.EncryptionException(
+                            "Cannot open auto-encrypted DB: auto key missing from storage", null,
+                            eu.siacs.conversations.EncryptionException.Reason.KEYSTORE_ERROR);
+                }
+                try {
+                    oldRawKey = eu.siacs.conversations.Argon2KeyDerivation.INSTANCE
+                            .deriveAutoRawKeyBytes(storedAutoKey);
+                } finally {
+                    java.util.Arrays.fill(storedAutoKey, (byte) 0);
+                }
+            }
+
+            // ENABLE_WRITE_AHEAD_LOGGING: the singleton already holds the DB in WAL mode;
+            // opening a second connection without this flag causes SQLCipher to attempt
+            // PRAGMA journal_mode=delete, which fails with SQLITE_BUSY on Android 8.1 and older.
+            SQLiteDatabase db;
+            try {
+                db = SQLiteDatabase.openDatabase(
+                        dbFile.getAbsolutePath(), oldRawKey, null,
+                        SQLiteDatabase.OPEN_READWRITE | SQLiteDatabase.ENABLE_WRITE_AHEAD_LOGGING,
+                        ARGON2_DATABASE_HOOK);
+            } finally {
+                java.util.Arrays.fill(oldRawKey, (byte) 0);
+            }
+
+            int version = db.getVersion();
+
+            // If the DB is brand-new and empty, skip the export and just configure prefs.
+            final boolean isEmpty;
+            try (final Cursor c = db.rawQuery(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table'", null)) {
+                isEmpty = version == 0 && c != null && c.moveToFirst() && c.getInt(0) == 0;
+            }
+            if (isEmpty) {
+                db.close();
+                tempFile.delete();
+                FileHelper.secureDelete(dbFile);
+                FileHelper.secureDelete(new File(dbFile.getAbsolutePath() + "-wal"));
+                FileHelper.secureDelete(new File(dbFile.getAbsolutePath() + "-shm"));
+                persistNewKeyState(settings, newPassword, newSalt, newAutoKey);
+                closeInstance();
+                return;
+            }
+
+            try {
+                db.rawExecSQL("PRAGMA cipher_default_use_hmac = ON;");
+                db.rawExecSQL("PRAGMA cipher_default_memory_security = ON;");
+                // CRITICAL: wrap in SQL string literal, not blob literal, so SQLCipher detects
+                // the x'...' prefix and uses raw-key mode (see SQLCipher API docs for KEY).
+                final String keyStr = new String(newRawKey, java.nio.charset.StandardCharsets.UTF_8);
+                final String attachKeySql = "'" + keyStr.replace("'", "''") + "'";
+                db.rawExecSQL("ATTACH DATABASE "
+                        + android.database.DatabaseUtils.sqlEscapeString(tempFile.getAbsolutePath())
+                        + " AS encrypted KEY " + attachKeySql);
+                db.rawExecSQL("SELECT sqlcipher_export('encrypted');");
+                db.rawExecSQL("PRAGMA encrypted.user_version = " + version);
+                db.rawExecSQL("DETACH DATABASE encrypted;");
+            } finally {
+                db.close();
+            }
+
+            final File backupFile = context.getDatabasePath(DATABASE_NAME + ".bak");
+            if (backupFile.exists() && !backupFile.delete()) {
+                throw new java.io.IOException("Failed to delete existing backup file");
+            }
+
+            PreferenceManager.getDefaultSharedPreferences(context)
+                    .edit().putBoolean(REKEY_MIGRATION_IN_PROGRESS, true).commit();
+
+            boolean prefsUpdated = false;
+            try {
+                if (!dbFile.renameTo(backupFile)) {
+                    throw new java.io.IOException("Failed to backup old database file");
+                }
+                if (!tempFile.renameTo(dbFile)) {
+                    if (!backupFile.renameTo(dbFile)) {
+                        Log.e(Config.LOGTAG, "rekey: CRITICAL — failed to rollback after temp rename failure");
+                    }
+                    throw new java.io.IOException("Failed to rename temporary database file");
+                }
+                // Persist new key state AFTER the file rename so the stored key always matches
+                // the DB file on disk (crash-safety invariant for recoverFromInterruptedMigration).
+                persistNewKeyState(settings, newPassword, newSalt, newAutoKey);
+                prefsUpdated = true;
+                PreferenceManager.getDefaultSharedPreferences(context)
+                        .edit().remove(REKEY_MIGRATION_IN_PROGRESS).commit();
+                FileHelper.secureDelete(backupFile);
+                FileHelper.secureDelete(new File(backupFile.getAbsolutePath() + "-wal"));
+                FileHelper.secureDelete(new File(backupFile.getAbsolutePath() + "-shm"));
+                FileHelper.secureDelete(new File(dbFile.getAbsolutePath() + "-wal"));
+                FileHelper.secureDelete(new File(dbFile.getAbsolutePath() + "-shm"));
+            } catch (Exception e) {
+                if (!prefsUpdated) {
+                    PreferenceManager.getDefaultSharedPreferences(context)
+                            .edit().remove(REKEY_MIGRATION_IN_PROGRESS).apply();
+                }
+                throw e;
+            }
+        } finally {
+            java.util.Arrays.fill(newRawKey, (byte) 0);
+            if (newAutoKey != null) java.util.Arrays.fill(newAutoKey, (byte) 0);
+        }
+        closeInstance();
+    }
+
+    /**
+     * Persists the new KDF state after a successful DB file rename.
+     * For Argon2id mode: writes password + salt, sets KDF flag, clears any auto key.
+     * For auto mode: writes new auto key, sets auto KDF flag, clears old password + salt.
+     */
+    private static void persistNewKeyState(
+            AppSettings settings, char[] newPassword, byte[] newSalt, byte[] newAutoKey) {
+        if (newPassword != null) {
+            settings.setDatabasePasswordAndSalt(newPassword, newSalt);
+            settings.setArgon2idKdf();
+            settings.clearAutoKey(); // clean up any pre-existing auto key
+        } else {
+            // Auto mode: write the new auto key first (crash-safe ordering), then update KDF.
+            settings.writeAutoKey(newAutoKey);
+            settings.setAutoKeyMode();
+            settings.clearPersistedDatabasePassword(); // clear any old user password
+            settings.clearMainDbArgon2Salt();           // clear old Argon2id salt
+        }
+    }
+
+    // Returns [conversationUuid, rawPayloads] for sent messages with live-location payloads
+    // sent within the last 8 hours for the given account.
+    public List<String[]> getRecentOutgoingLiveLocationMessages(final String accountUuid) {
+        final List<String[]> result = new ArrayList<>();
+        final long cutoff = System.currentTimeMillis() - 8 * 60 * 60 * 1000L;
+        final String sql = "SELECT m." + Message.CONVERSATION + ", m." + Message.PAYLOADS
+                + " FROM " + Message.TABLENAME + " m"
+                + " JOIN " + Conversation.TABLENAME + " c ON m." + Message.CONVERSATION + " = c." + Conversation.UUID
+                + " WHERE c." + Conversation.ACCOUNT + " = ?"
+                + " AND m." + Message.STATUS + " > 0"
+                + " AND m." + Message.PAYLOADS + " LIKE '%live-location%'"
+                + " AND m." + Message.TIME_SENT + " > ?";
+        try (Cursor cursor = getReadableDatabase().rawQuery(sql, new String[]{accountUuid, String.valueOf(cutoff)})) {
+            while (cursor.moveToNext()) {
+                result.add(new String[]{cursor.getString(0), cursor.getString(1)});
+            }
+        } catch (Exception e) {
+            Log.e(Config.LOGTAG, "Error querying outgoing live location messages", e);
+        }
+        return result;
+    }
+}

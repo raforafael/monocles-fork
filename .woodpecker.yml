@@ -1,0 +1,20 @@
+# Codeberg CI (Woodpecker) — build the fork's APK in the cloud.
+# Enable at: repo -> Settings -> CI/CD -> "Woodpecker CI".
+# Artifacts appear in the run UI; or download from the build output paths below.
+
+when:
+  event: [push, pull_request, manual]
+
+steps:
+  build:
+    image: registry.gitlab.com/fdroid/ci-images-client:latest
+    environment:
+      - CARGO_BUILD_JOBS=2
+    commands:
+      - git submodule update --init --recursive
+      - echo y | sdkmanager "platforms;android-36" > /dev/null
+      - echo y | sdkmanager "build-tools;36.0.0" > /dev/null
+      - echo y | sdkmanager "ndk;28.2.13676358" > /dev/null
+      - rustup toolchain install nightly-2026-03-23
+      - rustup target add --toolchain nightly-2026-03-23 aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
+      - ./gradlew --max-workers=2 -Dorg.gradle.jvmargs=-Xmx3g assembleMonocleschatFreeDebug

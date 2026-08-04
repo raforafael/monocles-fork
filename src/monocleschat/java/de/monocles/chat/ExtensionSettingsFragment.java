@@ -1,0 +1,195 @@
+package de.monocles.chat;
+
+import android.Manifest;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.util.Log;
+import android.view.LayoutInflater;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.Toast;
+
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.appcompat.app.AlertDialog;
+import androidx.preference.Preference;
+import androidx.databinding.DataBindingUtil;
+import androidx.recyclerview.widget.RecyclerView;
+
+import com.google.android.material.dialog.MaterialAlertDialogBuilder;
+import com.google.common.base.Strings;
+import com.google.common.primitives.Longs;
+import com.google.common.io.Files;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
+
+import eu.siacs.conversations.Config;
+import eu.siacs.conversations.R;
+import eu.siacs.conversations.databinding.FragmentExtensionSettingsBinding;
+import eu.siacs.conversations.databinding.ExtensionItemBinding;
+import eu.siacs.conversations.entities.Account;
+import eu.siacs.conversations.entities.Message;
+import eu.siacs.conversations.entities.StubConversation;
+import eu.siacs.conversations.persistance.FileBackend;
+import eu.siacs.conversations.ui.XmppActivity;
+import eu.siacs.conversations.ui.util.Attachment;
+import eu.siacs.conversations.worker.ExportBackupWorker;
+
+import java.io.File;
+import java.nio.file.Paths;
+
+public class ExtensionSettingsFragment extends androidx.fragment.app.Fragment {
+    FragmentExtensionSettingsBinding binding;
+
+    @Override
+    public void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+    }
+
+    @Override
+    public View onCreateView(final LayoutInflater inflater, ViewGroup container, Bundle savedInstanceState) {
+        binding = DataBindingUtil.inflate(inflater, R.layout.fragment_extension_settings, container, false);
+        binding.addExtension.setOnClickListener((v) -> {
+            final var intent = new Intent();
+            intent.setAction(Intent.ACTION_GET_CONTENT);
+            intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+            intent.setType("*/*");
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            startActivityForResult(Intent.createChooser(intent, getString(R.string.perform_action_with)), 0x1);
+        });
+
+        binding.extensionList.setAdapter(new RecyclerView.Adapter<WebxdcViewHolder>() {
+            final ArrayList<WebxdcPage> xdcs = new ArrayList<>();
+            final Map<WebxdcPage, File> fileMap = new HashMap<>();
+
+            @Override
+            public int getItemCount() {
+                xdcs.clear();
+                fileMap.clear();
+                final var activity = (XmppActivity) requireActivity();
+                final var xmppConnectionService = activity.xmppConnectionService;
+                if (xmppConnectionService == null) return xdcs.size();
+                final var dir = new File(xmppConnectionService.getExternalFilesDir(null), "extensions");
+                for (File file : Files.fileTraverser().breadthFirst(dir)) {
+                    if (file.isFile() && file.canRead()) {
+                        final var dummy = new Message(new StubConversation(null, "", null, 0), null, Message.ENCRYPTION_NONE);
+                        dummy.setStatus(Message.STATUS_DUMMY);
+                        dummy.setUuid(file.getName());
+                        final WebxdcPage xdc = new WebxdcPage(activity, file, dummy);
+                        xdcs.add(xdc);
+                        fileMap.put(xdc, file);
+                    }
+                }
+                return xdcs.size();
+            }
+
+            @Override
+            public WebxdcViewHolder onCreateViewHolder(ViewGroup parent, int viewType) {
+                final ExtensionItemBinding binding = DataBindingUtil.inflate(inflater, R.layout.extension_item, container, false);
+                return new WebxdcViewHolder(binding);
+            }
+
+            @Override
+            public void onBindViewHolder(WebxdcViewHolder holder, int position) {
+                final WebxdcPage xdc = xdcs.get(position);
+                holder.bind(xdc);
+                holder.binding.deleteButton.setOnClickListener(v -> {
+                    new MaterialAlertDialogBuilder(requireActivity())
+                            .setTitle(R.string.delete_extension_title)
+                            .setMessage(getString(R.string.delete_extension_message, xdc.getName()))
+                            .setPositiveButton(R.string.delete, (dialog, which) -> {
+                                deleteExtension(fileMap.get(xdc));
+                                dialog.dismiss();
+                            })
+                            .setNegativeButton(R.string.cancel, (dialog, which) -> dialog.cancel())
+                            .create()
+                            .show();
+                });
+            }
+        });
+
+        return binding.getRoot();
+    }
+
+    @Override
+    public void onSaveInstanceState(Bundle bundle) {
+        super.onSaveInstanceState(bundle);
+    }
+
+    @Override
+    public void onStart() {
+        super.onStart();
+        getActivity().setTitle(getString(R.string.pref_extensions_title));
+    }
+
+    public void addExtension(Uri uri) {
+        final var xmppConnectionService = ((XmppActivity) requireActivity()).xmppConnectionService;
+        if (xmppConnectionService == null) return;
+        try {
+            final var fileBackend = xmppConnectionService.getFileBackend();
+            final var base = fileBackend.calculateCids(fileBackend.openInputStream(uri))[0].toString();
+            final var target = new File(new File(xmppConnectionService.getExternalFilesDir(null), "extensions"), base + ".xdc");
+            fileBackend.copyFileToPrivateStorage(target, uri);
+        } catch (final Exception e) {
+            Toast.makeText(requireActivity(), "Could not copy extension: " + e, Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void deleteExtension(File file) {
+        if (file == null) {
+            Toast.makeText(requireActivity(), R.string.error_deleting_extension, Toast.LENGTH_SHORT).show();
+            Log.e("ExtensionSettings", "Attempted to delete a null file reference.");
+            return;
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                // Use the fully qualified name to resolve the ambiguity
+                java.nio.file.Files.deleteIfExists(file.toPath());
+            } else {
+                if (!file.delete() && file.exists()) {
+                    // Throw an exception if delete() returns false and the file still exists
+                    throw new IOException("Failed to delete file: " + file.getAbsolutePath());
+                }
+            }
+            Toast.makeText(requireActivity(), R.string.extension_deleted, Toast.LENGTH_SHORT).show();
+            // It's better to be specific about what changed in the adapter
+            // but notifyDataSetChanged() is okay for now.
+            binding.extensionList.getAdapter().notifyDataSetChanged();
+        } catch (Exception e) {
+            Log.e("ExtensionSettings", "Error deleting extension: " + file.getAbsolutePath(), e);
+            String errorMessage = getString(R.string.error_deleting_extension) + ": " + e.getMessage();
+            Toast.makeText(requireActivity(), errorMessage, Toast.LENGTH_LONG).show();
+        }
+    }
+
+
+
+    @Override
+    public void onActivityResult(int requestCode, int resultCode, final Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        for (final var attachment : Attachment.extractAttachments(requireActivity(), data, Attachment.Type.FILE)) {
+            if ("application/webxdc+zip".equals(attachment.getMime())) addExtension(attachment.getUri());
+        }
+        binding.extensionList.getAdapter().notifyDataSetChanged();
+    }
+
+    protected static class WebxdcViewHolder extends RecyclerView.ViewHolder {
+        final ExtensionItemBinding binding;
+
+        public WebxdcViewHolder(final ExtensionItemBinding binding) {
+            super(binding.getRoot());
+            this.binding = binding;
+        }
+
+        public void bind(WebxdcPage xdc) {
+            binding.icon.setImageDrawable(xdc.getIcon());
+            binding.name.setText(xdc.getName());
+        }
+    }
+}

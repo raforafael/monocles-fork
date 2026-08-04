@@ -1,0 +1,254 @@
+package eu.siacs.conversations.utils;
+
+import android.graphics.drawable.Drawable;
+import android.os.Handler;
+import android.os.Looper;
+
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArraySet;
+
+public class LiveLocationManager {
+
+    private static final LiveLocationManager INSTANCE = new LiveLocationManager();
+
+    public static LiveLocationManager getInstance() {
+        return INSTANCE;
+    }
+
+    private LiveLocationManager() {}
+
+    public interface PositionListener {
+        void onPositionUpdate(String sessionId, double latitude, double longitude);
+        void onSessionExpired(String sessionId);
+    }
+
+    public static class IncomingSession {
+        public final String sessionId;
+        public final String conversationUuid;
+        public final String messageUuid;
+        public volatile double latitude;
+        public volatile double longitude;
+        public final long expiresAt;
+
+        IncomingSession(String sessionId, String conversationUuid, String messageUuid, double lat, double lon, long expiresAt) {
+            this.sessionId = sessionId;
+            this.conversationUuid = conversationUuid;
+            this.messageUuid = messageUuid;
+            this.latitude = lat;
+            this.longitude = lon;
+            this.expiresAt = expiresAt;
+        }
+
+        public boolean isExpired() {
+            return System.currentTimeMillis() > expiresAt;
+        }
+    }
+
+    public static class OutgoingSession {
+        public final String sessionId;
+        public final String conversationUuid;
+        public final String messageUuid;
+        public final long expiresAt;
+        public volatile double latitude;
+        public volatile double longitude;
+
+        OutgoingSession(String sessionId, String conversationUuid, String messageUuid, long expiresAt, double lat, double lon) {
+            this.sessionId = sessionId;
+            this.conversationUuid = conversationUuid;
+            this.messageUuid = messageUuid;
+            this.expiresAt = expiresAt;
+            this.latitude = lat;
+            this.longitude = lon;
+        }
+
+        public boolean isExpired() {
+            return System.currentTimeMillis() > expiresAt;
+        }
+    }
+
+    private final ConcurrentHashMap<String, IncomingSession> incoming = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, String> messageToSession = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, OutgoingSession> outgoingByConversation = new ConcurrentHashMap<>();
+    private final CopyOnWriteArraySet<PositionListener> listeners = new CopyOnWriteArraySet<>();
+    private final ConcurrentHashMap<String, Drawable> sessionAvatars = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Long> previewRefreshTimes = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Boolean> stoppedSessionIds = new ConcurrentHashMap<>();
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private Runnable onSessionExpiredUiCallback = null;
+
+    public void registerIncomingSession(String sessionId, String conversationUuid, String messageUuid, double lat, double lon, long expiresAt) {
+        if (sessionId == null) {
+            return;
+        }
+        IncomingSession s = new IncomingSession(sessionId, conversationUuid, messageUuid, lat, lon, expiresAt);
+        incoming.put(sessionId, s);
+        if (messageUuid != null) {
+            messageToSession.put(messageUuid, sessionId);
+        }
+        scheduleExpiry(sessionId, expiresAt);
+    }
+
+    public void updateIncomingPosition(String sessionId, double lat, double lon) {
+        if (sessionId == null) {
+            return;
+        }
+        IncomingSession s = incoming.get(sessionId);
+        if (s != null && !s.isExpired()) {
+            s.latitude = lat;
+            s.longitude = lon;
+        }
+        for (PositionListener l : listeners) {
+            l.onPositionUpdate(sessionId, lat, lon);
+        }
+    }
+
+    public void notifyOutgoingPositionUpdate(String sessionId, double lat, double lon) {
+        if (sessionId == null) {
+            return;
+        }
+        for (OutgoingSession os : outgoingByConversation.values()) {
+            if (sessionId.equals(os.sessionId)) {
+                os.latitude = lat;
+                os.longitude = lon;
+                break;
+            }
+        }
+        for (PositionListener l : listeners) {
+            l.onPositionUpdate(sessionId, lat, lon);
+        }
+    }
+
+    public void setSessionAvatar(String sessionId, Drawable drawable) {
+        if (drawable != null) sessionAvatars.put(sessionId, drawable);
+    }
+
+    public Drawable getSessionAvatar(String sessionId) {
+        return sessionId != null ? sessionAvatars.get(sessionId) : null;
+    }
+
+    public boolean isPreviewRefreshDue(String sessionId, long throttleMs) {
+        if (sessionId == null) {
+            return false;
+        }
+        final long now = System.currentTimeMillis();
+        final Long last = previewRefreshTimes.get(sessionId);
+        if (last == null || now - last >= throttleMs) {
+            previewRefreshTimes.put(sessionId, now);
+            return true;
+        }
+        return false;
+    }
+
+    public boolean isActiveLiveLocationMessage(String messageUuid) {
+        if (messageUuid == null) {
+            return false;
+        }
+        String sessionId = messageToSession.get(messageUuid);
+        if (sessionId != null) {
+            IncomingSession s = incoming.get(sessionId);
+            if (s != null && !s.isExpired()) return true;
+        }
+        for (OutgoingSession os : outgoingByConversation.values()) {
+            if (messageUuid.equals(os.messageUuid) && !os.isExpired()) return true;
+        }
+        return false;
+    }
+
+    public IncomingSession getSessionForMessage(String messageUuid) {
+        if (messageUuid == null) {
+            return null;
+        }
+        String sessionId = messageToSession.get(messageUuid);
+        if (sessionId == null) return null;
+        IncomingSession s = incoming.get(sessionId);
+        return s != null && !s.isExpired() ? s : null;
+    }
+
+    public IncomingSession getSession(String sessionId) {
+        if (sessionId == null) {
+            return null;
+        }
+        return incoming.get(sessionId);
+    }
+
+    public String getSessionIdForMessage(String messageUuid) {
+        if (messageUuid == null) {
+            return null;
+        }
+        String sessionId = messageToSession.get(messageUuid);
+        if (sessionId != null) return sessionId;
+        for (OutgoingSession os : outgoingByConversation.values()) {
+            if (messageUuid.equals(os.messageUuid) && !os.isExpired()) return os.sessionId;
+        }
+        return null;
+    }
+
+    public void addListener(PositionListener l) {
+        listeners.add(l);
+    }
+
+    public void removeListener(PositionListener l) {
+        listeners.remove(l);
+    }
+
+    public void registerOutgoingSession(String conversationUuid, String sessionId, String messageUuid, long expiresAt, double lat, double lon) {
+        OutgoingSession os = new OutgoingSession(sessionId, conversationUuid, messageUuid, expiresAt, lat, lon);
+        outgoingByConversation.put(conversationUuid, os);
+    }
+
+    public OutgoingSession getOutgoingSession(String conversationUuid) {
+        OutgoingSession os = outgoingByConversation.get(conversationUuid);
+        return os != null && !os.isExpired() ? os : null;
+    }
+
+    public java.util.Collection<OutgoingSession> getAllOutgoingSessions() {
+        return outgoingByConversation.values();
+    }
+
+    public void clearOutgoingSession(String conversationUuid) {
+        if (conversationUuid != null) {
+            outgoingByConversation.remove(conversationUuid);
+        }
+    }
+
+    private void scheduleExpiry(String sessionId, long expiresAt) {
+        long delay = expiresAt - System.currentTimeMillis();
+        if (delay <= 0) {
+            expireSession(sessionId);
+            return;
+        }
+        mainHandler.postDelayed(() -> expireSession(sessionId), delay);
+    }
+
+    public void setOnSessionExpiredUiCallback(Runnable callback) {
+        this.onSessionExpiredUiCallback = callback;
+    }
+
+    public void expireIncomingSession(String sessionId) {
+        expireSession(sessionId);
+    }
+
+    public boolean isSessionStopped(String sessionId) {
+        return sessionId != null && stoppedSessionIds.containsKey(sessionId);
+    }
+
+    private void expireSession(String sessionId) {
+        if (sessionId == null) {
+            return;
+        }
+        stoppedSessionIds.put(sessionId, Boolean.TRUE);
+        IncomingSession s = incoming.remove(sessionId);
+        if (s != null) {
+            if (s.messageUuid != null) {
+                messageToSession.remove(s.messageUuid);
+            }
+            previewRefreshTimes.remove(sessionId);
+            for (PositionListener l : listeners) {
+                l.onSessionExpired(sessionId);
+            }
+            if (onSessionExpiredUiCallback != null) {
+                mainHandler.post(onSessionExpiredUiCallback);
+            }
+        }
+    }
+}

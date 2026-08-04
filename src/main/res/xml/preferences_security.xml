@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android">
+    <PreferenceCategory android:title="@string/pref_category_e2ee">
+        <ListPreference
+            android:defaultValue="@string/omemo_setting_default"
+            android:entries="@array/omemo_setting_entries"
+            android:entryValues="@array/omemo_setting_entry_values"
+            android:icon="@drawable/ic_lock_24dp"
+            android:key="omemo"
+            android:summary="@string/pref_omemo_setting_summary_default_on"
+            android:title="@string/pref_omemo_setting" />
+        <SwitchPreferenceCompat
+            android:defaultValue="@bool/btbv"
+            android:icon="@drawable/ic_verified_user_24dp"
+            android:key="btbv"
+            android:summary="@string/pref_blind_trust_before_verification_summary"
+            android:title="@string/pref_blind_trust_before_verification" />
+
+        <SwitchPreferenceCompat
+            android:defaultValue="@bool/allow_unencrypted"
+            android:icon="@drawable/outline_lock_open_24"
+            android:key="allow_unencrypted"
+            android:summary="@string/pref_allow_unencrypted_summary"
+            android:title="@string/pref_allow_unencrypted" />
+
+        <SwitchPreferenceCompat
+            android:defaultValue="@bool/legacy_omemo_enabled"
+            android:icon="@drawable/outline_lock_open_24"
+            android:key="legacy_omemo_enabled"
+            android:summary="@string/pref_legacy_omemo_enabled_summary"
+            android:title="@string/pref_legacy_omemo_enabled" />
+
+        <SwitchPreferenceCompat
+            android:defaultValue="@bool/omemo_default_legacy"
+            android:dependency="legacy_omemo_enabled"
+            android:icon="@drawable/ic_lock_24dp"
+            android:key="omemo_default_legacy"
+            android:summary="@string/pref_omemo_default_legacy_summary"
+            android:title="@string/pref_omemo_default_legacy" />
+
+        <SwitchPreferenceCompat
+            android:defaultValue="@bool/omemo2_session_without_onetime_prekey"
+            android:icon="@drawable/outline_lock_open_24"
+            android:key="omemo2_session_without_onetime_prekey"
+            android:summary="@string/pref_omemo2_session_without_onetime_prekey_summary"
+            android:title="@string/pref_omemo2_session_without_onetime_prekey" />
+
+        <SwitchPreferenceCompat
+            android:defaultValue="@bool/enable_otr"
+            android:icon="@drawable/ic_lock_24dp"
+            android:key="enable_otr_encryption"
+            android:summary="@string/pref_enable_otr_summary"
+            android:title="@string/pref_enable_otr" />
+
+        <Preference
+            android:icon="@drawable/outline_delete_red_24"
+            android:key="delete_omemo_identities"
+            android:summary="@string/pref_delete_omemo2_identities_summary"
+            android:title="@string/pref_delete_omemo2_identities" />
+
+        <ListPreference
+            android:defaultValue="@integer/omemo_auto_expiry"
+            android:icon="@drawable/ic_auto_delete_24dp"
+            android:key="omemo_auto_expiry"
+            android:summary="@string/pref_omemo_auto_expiry_summary"
+            android:title="@string/pref_omemo_auto_expiry" />
+
+    </PreferenceCategory>
+    <PreferenceCategory
+        android:key="server_connection"
+        android:title="@string/pref_category_server_connection">
+        <SwitchPreferenceCompat
+            android:defaultValue="@bool/enforce_dane"
+            android:icon="@drawable/shield_verified_big"
+            android:key="enforce_dane"
+            android:summary="@string/pref_enforce_dane_summary"
+            android:title="@string/pref_enforce_dane" />
+        <SwitchPreferenceCompat
+            android:defaultValue="@bool/require_tls_v1_3"
+            android:icon="@drawable/ic_enhanced_encryption_24dp"
+            android:key="require_tls_v1_3"
+            android:summary="@string/require_tls_v1_3"
+            android:title="@string/strong_transport_security" />
+        <SwitchPreferenceCompat
+            android:defaultValue="@bool/trust_system_ca_store"
+            android:icon="@drawable/ic_assured_workload_24dp"
+            android:key="trust_system_ca_store"
+            android:summary="@string/pref_title_trust_system_ca_store_summary"
+            android:title="@string/pref_title_trust_system_ca_store" />
+        <Preference
+            android:key="remove_trusted_certificates"
+            android:icon="@drawable/ic_delete_24dp"
+            android:summary="@string/pref_remove_trusted_certificates_summary"
+            android:title="@string/pref_remove_trusted_certificates_title" />
+
+        <SwitchPreferenceCompat
+            android:defaultValue="@bool/require_channel_binding"
+            android:icon="@drawable/ic_private_connectivity_24dp"
+            android:key="channel_binding_required"
+            android:summary="@string/detect_mim_summary"
+            android:title="@string/detect_mim" />
+    </PreferenceCategory>
+    <PreferenceCategory android:title="@string/pref_category_on_this_device">
+        <SwitchPreferenceCompat
+            android:defaultValue="@bool/app_lock_enabled"
+            android:key="app_lock_enabled"
+            android:icon="@drawable/ic_lock_24dp"
+            android:summary="@string/pref_app_lock_enable_summary"
+            android:title="@string/pref_app_lock_enable_title" />
+        <ListPreference
+            android:defaultValue="@integer/automatic_message_deletion"
+            android:icon="@drawable/ic_auto_delete_24dp"
+            android:key="automatic_message_deletion"
+            android:summary="@string/pref_automatically_delete_messages_description"
+            android:title="@string/pref_automatically_delete_messages" />
+        <Preference
+            android:key="database_encryption"
+            android:icon="@drawable/ic_lock_24dp"
+            android:title="@string/pref_database_encryption" />
+        <SwitchPreferenceCompat
+            android:defaultValue="false"
+            android:icon="@drawable/ic_lock_24dp"
+            android:key="require_password_on_startup"
+            android:title="@string/pref_require_startup_password_title"
+            android:summary="@string/pref_require_startup_password_summary" />
+    </PreferenceCategory>
+
+</PreferenceScreen>

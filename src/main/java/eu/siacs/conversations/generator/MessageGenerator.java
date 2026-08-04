@@ -1,0 +1,589 @@
+package eu.siacs.conversations.generator;
+
+import net.java.otr4j.OtrException;
+import net.java.otr4j.session.Session;
+
+import eu.siacs.conversations.Config;
+import eu.siacs.conversations.crypto.axolotl.AxolotlService;
+import eu.siacs.conversations.crypto.axolotl.XmppAxolotlMessage;
+import eu.siacs.conversations.crypto.axolotl.XmppOmemo2Message;
+import eu.siacs.conversations.entities.Account;
+import eu.siacs.conversations.entities.Conversation;
+import eu.siacs.conversations.entities.Conversational;
+import eu.siacs.conversations.entities.Message;
+import eu.siacs.conversations.services.XmppConnectionService;
+import eu.siacs.conversations.xml.Element;
+import eu.siacs.conversations.xml.Namespace;
+import eu.siacs.conversations.xmpp.Jid;
+import eu.siacs.conversations.xmpp.chatstate.ChatState;
+import eu.siacs.conversations.xmpp.forms.Data;
+import eu.siacs.conversations.xmpp.jingle.JingleConnectionManager;
+import eu.siacs.conversations.xmpp.jingle.JingleRtpConnection;
+import eu.siacs.conversations.xmpp.jingle.Media;
+import eu.siacs.conversations.xmpp.jingle.stanzas.Reason;
+import im.conversations.android.xmpp.model.correction.Replace;
+import im.conversations.android.xmpp.model.reactions.Reaction;
+import im.conversations.android.xmpp.model.reactions.Reactions;
+import im.conversations.android.xmpp.model.unique.OriginId;
+import com.google.common.collect.ImmutableList;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Date;
+import java.util.List;
+import java.util.Locale;
+import java.util.TimeZone;
+
+public class MessageGenerator extends AbstractGenerator {
+    public static final String OTR_FALLBACK_MESSAGE = "I would like to start a private (OTR encrypted) conversation but your client doesn’t seem to support that";
+    private static final String OMEMO_FALLBACK_MESSAGE =
+            "I sent you an OMEMO encrypted message but your client doesn’t seem to support that.";
+    private static final String OMEMO2_FALLBACK_MESSAGE = "This message is PQ OMEMO2 encrypted.";
+    private static final String PGP_FALLBACK_MESSAGE =
+            "I sent you a PGP encrypted message but your client doesn’t seem to support that.";
+    /**
+     * A file URL in the body is a fallback for every file-sharing description we attach, so it
+     * is marked once per namespace (XEP-0428). Receivers must drop the span only once — see
+     * Message#bodyMinusFallbacks.
+     */
+    public static final List<String> FILE_FALLBACK_NAMESPACES =
+            ImmutableList.of(Namespace.OOB, Namespace.SFS);
+
+    public MessageGenerator(XmppConnectionService service) {
+        super(service);
+    }
+
+    private im.conversations.android.xmpp.model.stanza.Message preparePacket(
+            final Message message, final boolean legacyEncryption) {
+        return preparePacket(message, legacyEncryption, false);
+    }
+
+    private im.conversations.android.xmpp.model.stanza.Message preparePacket(
+            final Message message, final boolean legacyEncryption, final boolean omemo2Mode) {
+        Conversation conversation = (Conversation) message.getConversation();
+        Account account = conversation.getAccount();
+        im.conversations.android.xmpp.model.stanza.Message packet =
+                new im.conversations.android.xmpp.model.stanza.Message();
+        packet.setFrom(account.getJid());
+        packet.setId(message.getUuid());
+
+        // Cleartext retraction (unencrypted / legacy chats): <retract> on the outer stanza.
+        // OMEMO2 retractions fall through to the normal flow so the <retract> is placed inside
+        // the encrypted SCE content by AxolotlService.encryptOmemo2.
+        if (message.isDeleted() && message.getRetractId() != null && !omemo2Mode) {
+            if (conversation.getMode() == Conversation.MODE_SINGLE || message.isPrivateMessage()) {
+                packet.setTo(message.getCounterpart());
+                packet.setType(im.conversations.android.xmpp.model.stanza.Message.Type.CHAT);
+            } else {
+                packet.setTo(message.getCounterpart().asBareJid());
+                packet.setType(im.conversations.android.xmpp.model.stanza.Message.Type.GROUPCHAT);
+            }
+            if (message.isPrivateMessage()) {
+                packet.addChild("x", "http://jabber.org/protocol/muc#user");
+            }
+            final Element retract = packet.addChild("retract", "urn:xmpp:message-retract:1");
+            retract.setAttribute("id", message.getRetractId());
+            final Element fallback = packet.addChild("fallback", "urn:xmpp:fallback:0");
+            fallback.setAttribute("for", "urn:xmpp:message-retract:1");
+            Element body = new Element("body");
+            body.setContent("This message has been retracted by the sender.");
+            packet.addChild(body);
+            packet.addChild("store", "urn:xmpp:hints");
+            return packet;
+        }
+
+        final boolean isWithSelf = conversation.getContact().isSelf();
+        if (conversation.getMode() == Conversation.MODE_SINGLE) {
+            packet.setTo(message.getCounterpart());
+            packet.setType(im.conversations.android.xmpp.model.stanza.Message.Type.CHAT);
+            if (!isWithSelf) {
+                packet.addChild("request", "urn:xmpp:receipts");
+            }
+        } else if (message.isPrivateMessage()) {
+            packet.setTo(message.getCounterpart());
+            packet.setType(im.conversations.android.xmpp.model.stanza.Message.Type.CHAT);
+            packet.addChild("x", "http://jabber.org/protocol/muc#user");
+            packet.addChild("request", "urn:xmpp:receipts");
+        } else {
+            packet.setTo(message.getCounterpart().asBareJid());
+            packet.setType(im.conversations.android.xmpp.model.stanza.Message.Type.GROUPCHAT);
+        }
+        if (conversation.isSingleOrPrivateAndNonAnonymous() && !message.isPrivateMessage()) {
+            packet.addChild("markable", "urn:xmpp:chat-markers:0");
+        }
+        if (message.getEphemeralTimer() > 0) {
+            if (!omemo2Mode) {
+                packet.addChild("ephemeral", Namespace.EPHEMERAL).setAttribute("timer", String.valueOf(message.getEphemeralTimer()));
+            }
+            packet.addChild("no-permanent-store", Namespace.HINTS);
+        }
+        if (!omemo2Mode && message.isEphemeralIWantOut()) {
+            packet.addChild("i-want-out", Namespace.EPHEMERAL);
+        }
+        if (message.getRawBody() == null && (message.getEphemeralTimer() > 0 || message.isEphemeralIWantOut())) {
+            packet.addChild("store", "urn:xmpp:hints");
+        }
+        if (conversation.getMode() == Conversational.MODE_MULTI
+                && !message.isPrivateMessage()
+                && !conversation.getMucOptions().stableId()) {
+            packet.addExtension(new OriginId(message.getUuid()));
+        } else if (conversation.getMode() == Conversational.MODE_SINGLE) {
+            packet.addExtension(new OriginId(message.getUuid()));
+        }
+        if (!omemo2Mode && message.edited() && !message.isDeleted()) {
+            packet.addExtension(new Replace(message.getEditedIdWireFormat()));
+        }
+
+        if (omemo2Mode) {
+            // All metadata (<subject>, <replace>, payloads) go into SCE content — nothing here
+        } else if (!legacyEncryption) {
+            if (message.getSubject() != null && message.getSubject().length() > 0) packet.addChild("subject").setContent(message.getSubject());
+            // Legacy encryption can't handle advanced payloads
+            for (Element el : message.getPayloads()) {
+                packet.addChild(el);
+            }
+        } else {
+            for (Element el : message.getPayloads()) {
+                // Allow <thread>, XEP-0461 <reply>, and XEP-0461 <fallback for reply> elements
+                if ("thread".equals(el.getName()) ||
+                        ("reply".equals(el.getName()) && "urn:xmpp:reply:0".equals(el.getNamespace())) ||
+                        ("fallback".equals(el.getName()) && "urn:xmpp:fallback:0".equals(el.getNamespace()) && "urn:xmpp:reply:0".equals(el.getAttribute("for")) && !message.hasFileOnRemoteHost())
+                ) {
+                    packet.addChild(el);
+                }
+            }
+        }
+        return packet;
+    }
+
+    public void addDelay(
+            im.conversations.android.xmpp.model.stanza.Message packet, long timestamp) {
+        final SimpleDateFormat mDateFormat =
+                new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US);
+        mDateFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
+        Element delay = packet.addChild("delay", "urn:xmpp:delay");
+        Date date = new Date(timestamp);
+        delay.setAttribute("stamp", mDateFormat.format(date));
+    }
+
+    public im.conversations.android.xmpp.model.stanza.Message generateAxolotlChat(
+            Message message, XmppAxolotlMessage axolotlMessage) {
+        im.conversations.android.xmpp.model.stanza.Message packet = preparePacket(message, true);
+        if (axolotlMessage == null) {
+            return null;
+        }
+        packet.setAxolotlMessage(axolotlMessage.toElement());
+        packet.setBody(OMEMO_FALLBACK_MESSAGE);
+        packet.addChild("store", "urn:xmpp:hints");
+        packet.addChild("encryption", "urn:xmpp:eme:0")
+                .setAttribute("name", "OMEMO")
+                .setAttribute("namespace", AxolotlService.PEP_PREFIX);
+        return packet;
+    }
+
+    public im.conversations.android.xmpp.model.stanza.Message generateOmemo2Chat(
+            final Message message, final XmppOmemo2Message omemo2Message) {
+        final im.conversations.android.xmpp.model.stanza.Message packet = preparePacket(message, true, true);
+        if (omemo2Message == null) return null;
+        packet.setAxolotlMessage(omemo2Message.toElement());
+        packet.setBody(OMEMO2_FALLBACK_MESSAGE);
+        packet.addChild("store", "urn:xmpp:hints");
+        packet.addChild("encryption", "urn:xmpp:eme:0")
+                .setAttribute("name", "PQ-OMEMO2")
+                .setAttribute("namespace", Namespace.OMEMO2);
+        return packet;
+    }
+
+    public im.conversations.android.xmpp.model.stanza.Message generateKeyTransportMessage(
+            Jid to, XmppAxolotlMessage axolotlMessage) {
+        im.conversations.android.xmpp.model.stanza.Message packet =
+                new im.conversations.android.xmpp.model.stanza.Message();
+        packet.setType(im.conversations.android.xmpp.model.stanza.Message.Type.CHAT);
+        packet.setTo(to);
+        packet.setAxolotlMessage(axolotlMessage.toElement());
+        packet.addChild("store", "urn:xmpp:hints");
+        return packet;
+    }
+
+    /** OMEMO2 key-transport (no payload) used to heal a broken OMEMO2 session. */
+    public im.conversations.android.xmpp.model.stanza.Message generateOmemo2KeyTransportMessage(
+            final Jid to, final XmppOmemo2Message omemo2Message) {
+        final im.conversations.android.xmpp.model.stanza.Message packet =
+                new im.conversations.android.xmpp.model.stanza.Message();
+        packet.setType(im.conversations.android.xmpp.model.stanza.Message.Type.CHAT);
+        packet.setTo(to);
+        packet.setAxolotlMessage(omemo2Message.toElement());
+        packet.addChild("store", "urn:xmpp:hints");
+        packet.addChild("encryption", "urn:xmpp:eme:0")
+                .setAttribute("name", "PQ-OMEMO2")
+                .setAttribute("namespace", Namespace.OMEMO2);
+        return packet;
+    }
+
+    private static String urlOf(final Message message) {
+        final Message.FileParams params = message.getFileParams();
+        return params == null ? null : params.url;
+    }
+
+    /**
+     * The XEP-0428 fallback markers for one file URL occupying {@code [start, end)} of the
+     * body, one per format that describes the same file.
+     */
+    public static List<Element> fileFallbacks(final int start, final int end) {
+        final ImmutableList.Builder<Element> fallbacks = ImmutableList.builder();
+        for (final String fallbackFor : FILE_FALLBACK_NAMESPACES) {
+            final Element fallback =
+                    new Element("fallback", "urn:xmpp:fallback:0").setAttribute("for", fallbackFor);
+            fallback.addChild("body", "urn:xmpp:fallback:0")
+                    .setAttribute("start", String.valueOf(start))
+                    .setAttribute("end", String.valueOf(end));
+            fallbacks.add(fallback);
+        }
+        return fallbacks.build();
+    }
+
+    /**
+     * One XEP-0447 {@code <file-sharing/>} element per file of {@code message}. When a message
+     * carries several files the XEP requires each element to have its own {@code id}; the
+     * message uuid of the row holding that file is used, which is also what the receiving side
+     * needs to line the files up with their rows.
+     */
+    public static List<Element> fileSharingElements(final Message message) {
+        final List<Message> files = message.getFileMessages();
+        final ImmutableList.Builder<Element> elements = ImmutableList.builder();
+        for (final Message file : files) {
+            final Message.FileParams params = file.getFileParams();
+            if (params == null || params.url == null) continue;
+            final Element fileSharing = params.toSfs();
+            if (files.size() > 1) {
+                fileSharing.setAttribute("id", file.getUuid());
+            }
+            elements.add(fileSharing);
+        }
+        return elements.build();
+    }
+
+    public im.conversations.android.xmpp.model.stanza.Message generateChat(Message message) {
+        im.conversations.android.xmpp.model.stanza.Message packet = preparePacket(message, false);
+        String content;
+        if (message.hasFileOnRemoteHost()) {
+            final Message.FileParams fileParams = message.getFileParams();
+
+            if (message.getFallbacks(Namespace.OOB).isEmpty()) {
+                for (final Message file : message.getFileMessages()) {
+                    final String url = urlOf(file);
+                    if (url == null) continue;
+                    final String raw = message.getRawBody() == null ? "" : message.getRawBody();
+                    // Keep a caption and its file URL on one line (the caption already ends
+                    // in a space); further files of the same message go on their own line.
+                    final String separator = raw.isEmpty() || raw.endsWith(" ") ? "" : "\n";
+                    final int start = raw.codePointCount(0, raw.length());
+                    final String appended = separator + url;
+                    message.appendBody(appended);
+                    for (final Element fallback :
+                            fileFallbacks(start, start + appended.codePointCount(0, appended.length()))) {
+                        message.addPayload(fallback);
+                    }
+                }
+            }
+
+            packet = preparePacket(message, false);
+            packet.addChild("x", Namespace.OOB).addChild("url").setContent(fileParams.url);
+            // XEP-0447: the structured description of every file of this message. Only ever
+            // emitted in the clear for unencrypted chats — the OMEMO2 path builds it inside
+            // the encrypted SCE payload (AxolotlService.encryptOmemo2) and legacy OMEMO/PGP
+            // never carry it, because sources and metadata would be readable by the server.
+            for (final Element fileSharing : fileSharingElements(message)) {
+                packet.addChild(fileSharing);
+            }
+        }
+        if (message.getRawBody() != null && !message.isDeleted())
+            packet.setBody(message.getRawBody());
+        return packet;
+    }
+
+    public im.conversations.android.xmpp.model.stanza.Message generatePgpChat(Message message) {
+        final im.conversations.android.xmpp.model.stanza.Message packet = preparePacket(message, true);
+        if (message.hasFileOnRemoteHost()) {
+            Message.FileParams fileParams = message.getFileParams();
+            final String url = fileParams.url;
+            packet.setBody(url);
+            packet.addChild("x", Namespace.OOB).addChild("url").setContent(url);
+            packet.addChild("fallback", "urn:xmpp:fallback:0").setAttribute("for", Namespace.OOB)
+                    .addChild("body", "urn:xmpp:fallback:0");
+        } else {
+            if (Config.supportUnencrypted()) {
+                packet.setBody(PGP_FALLBACK_MESSAGE);
+            }
+            if (message.getEncryption() == Message.ENCRYPTION_DECRYPTED) {
+                packet.addChild("x", "jabber:x:encrypted").setContent(message.getEncryptedBody());
+            } else if (message.getEncryption() == Message.ENCRYPTION_PGP) {
+                packet.addChild("x", "jabber:x:encrypted").setContent(message.getBody());
+            }
+            packet.addChild("encryption", "urn:xmpp:eme:0")
+                    .setAttribute("namespace", "jabber:x:encrypted");
+        }
+        return packet;
+    }
+
+    public static void addMessageHints(im.conversations.android.xmpp.model.stanza.Message packet) {
+        packet.addChild("private", "urn:xmpp:carbons:2");
+        packet.addChild("no-copy", "urn:xmpp:hints");
+        packet.addChild("no-permanent-store", "urn:xmpp:hints");
+        packet.addChild("no-permanent-storage", "urn:xmpp:hints"); //do not copy this. this is wrong. it is *store*
+    }
+
+    public im.conversations.android.xmpp.model.stanza.Message generateOtrChat(Message message) {
+        Conversation conversation = (Conversation) message.getConversation();
+        Session otrSession = conversation.getOtrSession();
+        if (otrSession == null) {
+            return null;
+        }
+        im.conversations.android.xmpp.model.stanza.Message packet = preparePacket(message, true);
+        addMessageHints(packet);
+        try {
+            String content;
+            if (message.hasFileOnRemoteHost()) {
+                content = message.getFileParams().url.toString();
+            } else {
+                content = message.getBody();
+            }
+            packet.setBody(otrSession.transformSending(content)[0]);
+            packet.addChild("encryption", "urn:xmpp:eme:0").setAttribute("namespace", "urn:xmpp:otr:0");
+            return packet;
+        } catch (OtrException e) {
+            return null;
+        }
+    }
+
+    public im.conversations.android.xmpp.model.stanza.Message generateChatState(
+            Conversation conversation) {
+        final Account account = conversation.getAccount();
+        final im.conversations.android.xmpp.model.stanza.Message packet =
+                new im.conversations.android.xmpp.model.stanza.Message();
+        packet.setType(
+                conversation.getMode() == Conversation.MODE_MULTI
+                        ? im.conversations.android.xmpp.model.stanza.Message.Type.GROUPCHAT
+                        : im.conversations.android.xmpp.model.stanza.Message.Type.CHAT);
+        packet.setTo(conversation.getJid().asBareJid());
+        packet.setFrom(account.getJid());
+        packet.addChild(ChatState.toElement(conversation.getOutgoingChatState()));
+        packet.addChild("no-store", "urn:xmpp:hints");
+        packet.addChild("no-storage", "urn:xmpp:hints"); // wrong! don't copy this. Its *store*
+        return packet;
+    }
+
+    public im.conversations.android.xmpp.model.stanza.Message confirm(final Message message) {
+        final boolean groupChat = message.getConversation().getMode() == Conversational.MODE_MULTI;
+        final Jid to = message.getCounterpart();
+        final im.conversations.android.xmpp.model.stanza.Message packet =
+                new im.conversations.android.xmpp.model.stanza.Message();
+        packet.setType(
+                groupChat
+                        ? im.conversations.android.xmpp.model.stanza.Message.Type.GROUPCHAT
+                        : im.conversations.android.xmpp.model.stanza.Message.Type.CHAT);
+        packet.setTo(groupChat ? to.asBareJid() : to);
+        final Element displayed = packet.addChild("displayed", "urn:xmpp:chat-markers:0");
+        if (groupChat) {
+            final String stanzaId = message.getServerMsgId();
+            if (stanzaId != null) {
+                displayed.setAttribute("id", stanzaId);
+            } else {
+                displayed.setAttribute("sender", to.toString());
+                displayed.setAttribute("id", message.getRemoteMsgId());
+            }
+        } else {
+            displayed.setAttribute("id", message.getRemoteMsgId());
+        }
+        packet.addChild("store", "urn:xmpp:hints");
+        return packet;
+    }
+
+    public im.conversations.android.xmpp.model.stanza.Message reaction(
+            final Jid to,
+            final boolean groupChat,
+            final Message inReplyTo,
+            final String reactingTo,
+            final Collection<String> ourReactions) {
+        final im.conversations.android.xmpp.model.stanza.Message packet =
+                new im.conversations.android.xmpp.model.stanza.Message();
+        packet.setType(
+                groupChat
+                        ? im.conversations.android.xmpp.model.stanza.Message.Type.GROUPCHAT
+                        : im.conversations.android.xmpp.model.stanza.Message.Type.CHAT);
+        packet.setTo(to);
+        final var reactions = packet.addExtension(new Reactions());
+        reactions.setId(reactingTo);
+        for (final String ourReaction : ourReactions) {
+            reactions.addExtension(new Reaction(ourReaction));
+        }
+
+        final var thread = inReplyTo.getThread();
+        if (thread != null) packet.addChild(thread);
+
+        packet.addChild("store", "urn:xmpp:hints");
+        return packet;
+    }
+
+    public im.conversations.android.xmpp.model.stanza.Message conferenceSubject(
+            Conversation conversation, String subject) {
+        im.conversations.android.xmpp.model.stanza.Message packet =
+                new im.conversations.android.xmpp.model.stanza.Message();
+        packet.setType(im.conversations.android.xmpp.model.stanza.Message.Type.GROUPCHAT);
+        packet.setTo(conversation.getJid().asBareJid());
+        packet.addChild("subject").setContent(subject);
+        packet.setFrom(conversation.getAccount().getJid().asBareJid());
+        return packet;
+    }
+
+    public im.conversations.android.xmpp.model.stanza.Message requestVoice(Jid jid) {
+        final var packet = new im.conversations.android.xmpp.model.stanza.Message();
+        packet.setType(im.conversations.android.xmpp.model.stanza.Message.Type.NORMAL);
+        packet.setTo(jid.asBareJid());
+        final var form = new Data();
+        form.setFormType("http://jabber.org/protocol/muc#request");
+        form.put("muc#role", "participant");
+        form.submit();
+        packet.addChild(form);
+        return packet;
+    }
+
+    public im.conversations.android.xmpp.model.stanza.Message directInvite(
+            final Conversation conversation, final Jid contact) {
+        im.conversations.android.xmpp.model.stanza.Message packet =
+                new im.conversations.android.xmpp.model.stanza.Message();
+        packet.setType(im.conversations.android.xmpp.model.stanza.Message.Type.NORMAL);
+        packet.setTo(contact);
+        packet.setFrom(conversation.getAccount().getJid());
+        Element x = packet.addChild("x", "jabber:x:conference");
+        x.setAttribute("jid", conversation.getJid().asBareJid());
+        String password = conversation.getMucOptions().getPassword();
+        if (password != null) {
+            x.setAttribute("password", password);
+        }
+        if (contact.isFullJid()) {
+            packet.addChild("no-store", "urn:xmpp:hints");
+            packet.addChild("no-copy", "urn:xmpp:hints");
+        }
+        return packet;
+    }
+
+    public im.conversations.android.xmpp.model.stanza.Message invite(
+            final Conversation conversation, final Jid contact) {
+        final var packet = new im.conversations.android.xmpp.model.stanza.Message();
+        packet.setTo(conversation.getJid().asBareJid());
+        packet.setFrom(conversation.getAccount().getJid());
+        Element x = new Element("x");
+        x.setAttribute("xmlns", "http://jabber.org/protocol/muc#user");
+        Element invite = new Element("invite");
+        invite.setAttribute("to", contact.asBareJid());
+        x.addChild(invite);
+        packet.addChild(x);
+        return packet;
+    }
+
+    public im.conversations.android.xmpp.model.stanza.Message received(
+            Account account,
+            final Jid from,
+            final String id,
+            ArrayList<String> namespaces,
+            im.conversations.android.xmpp.model.stanza.Message.Type type) {
+        final var receivedPacket = new im.conversations.android.xmpp.model.stanza.Message();
+        receivedPacket.setType(type);
+        receivedPacket.setTo(from);
+        receivedPacket.setFrom(account.getJid());
+        for (final String namespace : namespaces) {
+            receivedPacket.addChild("received", namespace).setAttribute("id", id);
+        }
+        receivedPacket.addChild("store", "urn:xmpp:hints");
+        return receivedPacket;
+    }
+
+    public im.conversations.android.xmpp.model.stanza.Message received(
+            Account account, Jid to, String id) {
+        im.conversations.android.xmpp.model.stanza.Message packet =
+                new im.conversations.android.xmpp.model.stanza.Message();
+        packet.setFrom(account.getJid());
+        packet.setTo(to);
+        packet.addChild("received", "urn:xmpp:receipts").setAttribute("id", id);
+        packet.addChild("store", "urn:xmpp:hints");
+        return packet;
+    }
+
+    public im.conversations.android.xmpp.model.stanza.Message sessionFinish(
+            final Jid with, final String sessionId, final Reason reason) {
+        final im.conversations.android.xmpp.model.stanza.Message packet =
+                new im.conversations.android.xmpp.model.stanza.Message();
+        packet.setType(im.conversations.android.xmpp.model.stanza.Message.Type.CHAT);
+        packet.setTo(with);
+        final Element finish = packet.addChild("finish", Namespace.JINGLE_MESSAGE);
+        finish.setAttribute("id", sessionId);
+        final Element reasonElement = finish.addChild("reason", Namespace.JINGLE);
+        reasonElement.addChild(reason.toString());
+        packet.addChild("store", "urn:xmpp:hints");
+        return packet;
+    }
+
+    public im.conversations.android.xmpp.model.stanza.Message generateOtrError(Jid to, String id, String errorText) {
+        im.conversations.android.xmpp.model.stanza.Message packet = new im.conversations.android.xmpp.model.stanza.Message();
+        packet.setType(im.conversations.android.xmpp.model.stanza.Message.Type.ERROR);
+        packet.setAttribute("id", id);
+        packet.setTo(to);
+        Element error = packet.addChild("error");
+        error.setAttribute("code", "406");
+        error.setAttribute("type", "modify");
+        error.addChild("not-acceptable", "urn:ietf:params:xml:ns:xmpp-stanzas");
+        error.addChild("text").setContent("?OTR Error:" + errorText);
+        return packet;
+    }
+
+    public im.conversations.android.xmpp.model.stanza.Message sessionProposal(
+            final JingleConnectionManager.RtpSessionProposal proposal) {
+        final im.conversations.android.xmpp.model.stanza.Message packet =
+                new im.conversations.android.xmpp.model.stanza.Message();
+        packet.setType(
+                im.conversations.android.xmpp.model.stanza.Message.Type
+                        .CHAT); // we want to carbon copy those
+        packet.setTo(proposal.with);
+        packet.setId(JingleRtpConnection.JINGLE_MESSAGE_PROPOSE_ID_PREFIX + proposal.sessionId);
+        final Element propose = packet.addChild("propose", Namespace.JINGLE_MESSAGE);
+        propose.setAttribute("id", proposal.sessionId);
+        for (final Media media : proposal.media) {
+            propose.addChild("description", Namespace.JINGLE_APPS_RTP)
+                    .setAttribute("media", media.toString());
+        }
+        packet.addChild("request", "urn:xmpp:receipts");
+        packet.addChild("store", "urn:xmpp:hints");
+        return packet;
+    }
+
+    public im.conversations.android.xmpp.model.stanza.Message sessionRetract(
+            final JingleConnectionManager.RtpSessionProposal proposal) {
+        final im.conversations.android.xmpp.model.stanza.Message packet =
+                new im.conversations.android.xmpp.model.stanza.Message();
+        packet.setType(
+                im.conversations.android.xmpp.model.stanza.Message.Type
+                        .CHAT); // we want to carbon copy those
+        packet.setTo(proposal.with);
+        final Element propose = packet.addChild("retract", Namespace.JINGLE_MESSAGE);
+        propose.setAttribute("id", proposal.sessionId);
+        propose.addChild("description", Namespace.JINGLE_APPS_RTP);
+        packet.addChild("store", "urn:xmpp:hints");
+        return packet;
+    }
+
+    public im.conversations.android.xmpp.model.stanza.Message sessionReject(
+            final Jid with, final String sessionId) {
+        final im.conversations.android.xmpp.model.stanza.Message packet =
+                new im.conversations.android.xmpp.model.stanza.Message();
+        packet.setType(
+                im.conversations.android.xmpp.model.stanza.Message.Type
+                        .CHAT); // we want to carbon copy those
+        packet.setTo(with);
+        final Element propose = packet.addChild("reject", Namespace.JINGLE_MESSAGE);
+        propose.setAttribute("id", sessionId);
+        propose.addChild("description", Namespace.JINGLE_APPS_RTP);
+        packet.addChild("store", "urn:xmpp:hints");
+        return packet;
+    }
+}

@@ -1,0 +1,271 @@
+package eu.siacs.conversations.ui;
+
+import android.Manifest;
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.Intent;
+import android.content.ServiceConnection;
+import android.content.pm.PackageManager;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.IBinder;
+import android.view.LayoutInflater;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import androidx.fragment.app.Fragment;
+import androidx.recyclerview.widget.LinearLayoutManager;
+import androidx.recyclerview.widget.RecyclerView;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+import eu.siacs.conversations.R;
+import eu.siacs.conversations.entities.Account;
+import eu.siacs.conversations.entities.Contact;
+import eu.siacs.conversations.entities.Conversation;
+import eu.siacs.conversations.entities.Message;
+import eu.siacs.conversations.services.CallIntegrationConnectionService;
+import eu.siacs.conversations.services.XmppConnectionService;
+import eu.siacs.conversations.ui.adapter.CallsAdapter;
+
+public class CallsFragment extends Fragment implements CallsAdapter.OnCallAgainClickListener, CallsAdapter.OnContactClickListener, XmppConnectionService.OnCallLogUpdated {
+
+    private XmppConnectionService xmppConnectionService;
+    private RecyclerView recyclerView;
+    private TextView emptyView;
+    private CallsAdapter adapter;
+    private final List<Message> calls = new ArrayList<>();
+    private Message mPendingCall;
+    private boolean mCallsLoaded = false;
+    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+
+    private static final int REQUEST_START_AUDIO_CALL = 0x213;
+    private static final int REQUEST_START_VIDEO_CALL = 0x214;
+
+    private final ServiceConnection mConnection = new ServiceConnection() {
+        @Override
+        public void onServiceConnected(ComponentName className, IBinder service) {
+            XmppConnectionService.XmppConnectionBinder binder = (XmppConnectionService.XmppConnectionBinder) service;
+            xmppConnectionService = binder.getService();
+            if (xmppConnectionService != null) {
+                xmppConnectionService.setOnCallLogUpdatedListener(CallsFragment.this);
+                if (!mCallsLoaded) {
+                    loadCalls();
+                }
+            }
+        }
+
+        @Override
+        public void onServiceDisconnected(ComponentName arg0) {
+            if (xmppConnectionService != null) {
+                xmppConnectionService.removeOnCallLogUpdatedListener(CallsFragment.this);
+            }
+            xmppConnectionService = null;
+        }
+    };
+
+    @Override
+    public void onStart() {
+        super.onStart();
+        Intent intent = new Intent(getActivity(), XmppConnectionService.class);
+        getActivity().bindService(intent, mConnection, Context.BIND_AUTO_CREATE);
+    }
+
+    @Override
+    public void onStop() {
+        super.onStop();
+        if (xmppConnectionService != null) {
+            xmppConnectionService.removeOnCallLogUpdatedListener(this);
+        }
+        getActivity().unbindService(mConnection);
+    }
+
+    @Nullable
+    @Override
+    public View onCreateView(@NonNull LayoutInflater inflater, @Nullable ViewGroup container, @Nullable Bundle savedInstanceState) {
+        View view = inflater.inflate(R.layout.fragment_calls, container, false);
+        recyclerView = view.findViewById(R.id.list);
+        recyclerView.setLayoutManager(new LinearLayoutManager(getContext()));
+        emptyView = view.findViewById(R.id.empty_view);
+        return view;
+    }
+
+    private void loadCalls() {
+        if (xmppConnectionService == null) {
+            return;
+        }
+        executor.execute(() -> {
+            final List<Message> loadedCalls = getCalls();
+            if (getActivity() != null) {
+                getActivity().runOnUiThread(() -> {
+                    calls.clear();
+                    calls.addAll(loadedCalls);
+                    if (recyclerView.getAdapter() == null) {
+                        adapter = new CallsAdapter(calls, this, this, xmppConnectionService);
+                        recyclerView.setAdapter(adapter);
+                    } else {
+                        adapter.notifyDataSetChanged();
+                    }
+                    updateViewStates();
+                    mCallsLoaded = true;
+                });
+            }
+        });
+    }
+
+    private void updateViewStates() {
+        if (calls.isEmpty()) {
+            recyclerView.setVisibility(View.GONE);
+            emptyView.setVisibility(View.VISIBLE);
+        } else {
+            recyclerView.setVisibility(View.VISIBLE);
+            emptyView.setVisibility(View.GONE);
+        }
+    }
+
+    private List<Message> getCalls() {
+        List<Message> calls = new ArrayList<>();
+        if (xmppConnectionService == null) {
+            return calls;
+        }
+        for (Conversation conversation : xmppConnectionService.getConversations()) {
+            // Limiting to last 100 messages per conversation for performance
+            calls.addAll(xmppConnectionService.databaseBackend.getMessages(conversation, Message.TYPE_RTP_SESSION, 100));
+        }
+        Collections.sort(calls, (o1, o2) -> Long.compare(o2.getTimeSent(), o1.getTimeSent()));
+        return calls;
+    }
+
+    @Override
+    public void onCallAgainClick(Message call, boolean isVideoCall) {
+        mPendingCall = call;
+        if (isVideoCall) {
+            checkPermissionAndTriggerVideoCall();
+        } else {
+            checkPermissionAndTriggerAudioCall();
+        }
+    }
+
+    private void checkPermissionAndTriggerAudioCall() {
+        if (xmppConnectionService.useTorToConnect() || mPendingCall.getConversation().getAccount().isOnion()) {
+            Toast.makeText(getActivity(), R.string.disable_tor_to_make_call, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (xmppConnectionService.useI2PToConnect() || mPendingCall.getConversation().getAccount().isI2P()) {
+            Toast.makeText(getActivity(), R.string.no_i2p_calls, Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        final List<String> permissions;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            permissions = Arrays.asList(Manifest.permission.RECORD_AUDIO, Manifest.permission.BLUETOOTH_CONNECT);
+        } else {
+            permissions = Collections.singletonList(Manifest.permission.RECORD_AUDIO);
+        }
+        if (hasPermissions(permissions, REQUEST_START_AUDIO_CALL)) {
+            triggerRtpSession(RtpSessionActivity.ACTION_MAKE_VOICE_CALL);
+        }
+    }
+
+    private void checkPermissionAndTriggerVideoCall() {
+        if (xmppConnectionService.useTorToConnect() || mPendingCall.getConversation().getAccount().isOnion()) {
+            Toast.makeText(getActivity(), R.string.disable_tor_to_make_call, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (xmppConnectionService.useI2PToConnect() || mPendingCall.getConversation().getAccount().isI2P()) {
+            Toast.makeText(getActivity(), R.string.no_i2p_calls, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        final List<String> permissions;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            permissions = Arrays.asList(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA, Manifest.permission.BLUETOOTH_CONNECT);
+        } else {
+            permissions = Arrays.asList(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA);
+        }
+        if (hasPermissions(permissions, REQUEST_START_VIDEO_CALL)) {
+            triggerRtpSession(RtpSessionActivity.ACTION_MAKE_VIDEO_CALL);
+        }
+    }
+
+    private boolean hasPermissions(List<String> permissions, int requestCode) {
+        final List<String> missingPermissions = new ArrayList<>();
+        for (String permission : permissions) {
+            if (getActivity().checkSelfPermission(permission) != PackageManager.PERMISSION_GRANTED) {
+                missingPermissions.add(permission);
+            }
+        }
+        if (missingPermissions.size() == 0) {
+            return true;
+        } else {
+            requestPermissions(missingPermissions.toArray(new String[0]), requestCode);
+            return false;
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
+        if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            if (mPendingCall != null) {
+                if(requestCode == REQUEST_START_AUDIO_CALL) {
+                    triggerRtpSession(RtpSessionActivity.ACTION_MAKE_VOICE_CALL);
+                } else if (requestCode == REQUEST_START_VIDEO_CALL) {
+                    triggerRtpSession(RtpSessionActivity.ACTION_MAKE_VIDEO_CALL);
+                }
+            }
+        }
+    }
+
+    private void triggerRtpSession(final String action) {
+        if (xmppConnectionService.getJingleConnectionManager().isBusy()) {
+            Toast.makeText(getActivity(), R.string.only_one_call_at_a_time, Toast.LENGTH_LONG).show();
+            return;
+        }
+        final Conversation conversation = (Conversation) mPendingCall.getConversation();
+        final Account account = conversation.getAccount();
+        if (account.setOption(Account.OPTION_SOFT_DISABLED, false)) {
+            xmppConnectionService.updateAccount(account);
+        }
+        if (conversation.getMode() == Conversation.MODE_MULTI) {
+            final boolean video = RtpSessionActivity.ACTION_MAKE_VIDEO_CALL.equals(action);
+            xmppConnectionService
+                    .getJingleConnectionManager()
+                    .getMujiConferenceManager()
+                    .placeGroupCall(conversation, video);
+            final Intent intent = new Intent(getActivity(), RtpSessionActivity.class);
+            intent.setAction(Intent.ACTION_VIEW);
+            intent.putExtra(
+                    RtpSessionActivity.EXTRA_ACCOUNT, account.getJid().asBareJid().toString());
+            intent.putExtra(RtpSessionActivity.EXTRA_MUJI_ROOM, conversation.getJid().asBareJid().toString());
+            intent.putExtra(RtpSessionActivity.EXTRA_LAST_ACTION, action);
+            startActivity(intent);
+        } else {
+            CallIntegrationConnectionService.placeCall(
+                    xmppConnectionService,
+                    account,
+                    conversation.getJid(),
+                    RtpSessionActivity.actionToMedia(action));
+        }
+        mPendingCall = null;
+    }
+
+    @Override
+    public void onContactClick(Contact contact) {
+        if (getActivity() instanceof XmppActivity) {
+            ((XmppActivity) getActivity()).switchToContactDetails(contact);
+        }
+    }
+
+    @Override
+    public void onCallLogUpdated() {
+        loadCalls();
+    }
+}

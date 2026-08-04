@@ -1,0 +1,199 @@
+package eu.siacs.conversations.ui.adapter;
+
+import android.content.Intent;
+import android.graphics.drawable.Drawable;
+import android.text.format.DateUtils;
+import android.view.LayoutInflater;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.ImageView;
+import android.widget.TextView;
+import androidx.annotation.NonNull;
+import androidx.recyclerview.widget.RecyclerView;
+import android.os.Handler;
+import androidx.recyclerview.widget.LinearLayoutManager;
+
+import com.bumptech.glide.Glide;
+
+import java.util.ArrayList;
+import java.util.List;
+import eu.siacs.conversations.R;
+import eu.siacs.conversations.entities.Account;
+import eu.siacs.conversations.entities.Contact;
+import eu.siacs.conversations.entities.Conversation;
+import eu.siacs.conversations.entities.Story;
+import eu.siacs.conversations.ui.StoryViewActivity;
+import eu.siacs.conversations.ui.XmppActivity;
+import eu.siacs.conversations.ui.util.AvatarWorkerTask;
+import eu.siacs.conversations.xmpp.Jid;
+
+public class StoryAdapter extends RecyclerView.Adapter<StoryAdapter.StoryViewHolder> {
+
+    private final XmppActivity activity;
+    private final List<Story> stories;
+
+    private final Handler handler = new Handler();
+    private final Runnable refreshRunnable;
+    private RecyclerView recyclerView;
+
+    public StoryAdapter(XmppActivity activity, List<Story> stories) {
+        this.activity = activity;
+        this.stories = stories;
+        this.refreshRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (recyclerView != null) {
+                    // This is a more efficient way to refresh just the visible items
+                    final LinearLayoutManager layoutManager = (LinearLayoutManager) recyclerView.getLayoutManager();
+                    if (layoutManager != null) {
+                        final int first = layoutManager.findFirstVisibleItemPosition();
+                        final int last = layoutManager.findLastVisibleItemPosition();
+                        if (first != RecyclerView.NO_POSITION) {
+                            notifyItemRangeChanged(first, (last - first) + 1, "payload_time");
+                        }
+                    }
+                }
+                handler.postDelayed(this, 60000); // Run again in 1 minute
+            }
+        };
+    }
+
+    @NonNull
+    @Override
+    public StoryViewHolder onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
+        View view = LayoutInflater.from(parent.getContext()).inflate(R.layout.list_item_story, parent, false);
+        return new StoryViewHolder(view);
+    }
+
+    @Override
+    public void onBindViewHolder(@NonNull StoryViewHolder holder, int position, @NonNull List<Object> payloads) {
+        if (payloads.contains("payload_time")) {
+            final Story story = stories.get(position);
+            holder.storyTime.setText(DateUtils.getRelativeTimeSpanString(story.getPublished(), System.currentTimeMillis(), DateUtils.MINUTE_IN_MILLIS));
+        } else {
+            super.onBindViewHolder(holder, position, payloads);
+        }
+    }
+
+    @Override
+    public void onBindViewHolder(@NonNull StoryViewHolder holder, int position) {
+        final Story story = stories.get(position);
+        final Jid jid = story.getContact();
+        final int avatarSize = activity.getResources().getDimensionPixelSize(R.dimen.avatar_story_size);
+
+        Contact contact = null;
+        Account storyAccount = null;
+
+        List<Contact> contacts = activity.xmppConnectionService.findContacts(jid, null);
+        if (!contacts.isEmpty()) {
+            Contact bestContact = null;
+            int bestScore = -1;
+            for (Contact c : contacts) {
+                int score = 0;
+                if (c.getAccount().getStatus() == Account.State.ONLINE) {
+                    score += 2;
+                }
+                Drawable d = activity.xmppConnectionService.getAvatarService().get(c, avatarSize);
+                if (!(d instanceof eu.siacs.conversations.services.AvatarService.TextDrawable)) {
+                    score += 1;
+                }
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestContact = c;
+                }
+            }
+            contact = bestContact;
+        }
+
+        if (contact != null) {
+            storyAccount = contact.getAccount();
+        } else if (activity.xmppConnectionService.findAccountByJid(jid) != null) {
+            storyAccount = activity.xmppConnectionService.findAccountByJid(jid);
+            if (storyAccount != null) {
+                contact = storyAccount.getSelfContact();
+            }
+        }
+
+        if (contact != null) {
+            holder.storyTitle.setText(contact.getDisplayName());
+            Conversation conversation = activity.xmppConnectionService.findOrCreateConversation(storyAccount, contact.getJid(), false, false);
+            AvatarWorkerTask.loadAvatar(conversation, holder.storyImage, R.dimen.avatar_on_conversation_overview);
+        } else {
+            holder.storyTitle.setText(jid.asBareJid().toString());
+            holder.storyImage.setImageResource(R.drawable.ic_person_48dp);
+        }
+
+        holder.storyTime.setText(DateUtils.getRelativeTimeSpanString(story.getPublished(), System.currentTimeMillis(), DateUtils.MINUTE_IN_MILLIS));
+
+        Glide.with(activity).load(story.getUrl()).into(holder.storyPreview);
+
+        final Account finalStoryAccount = storyAccount;
+        holder.itemView.setOnClickListener(v -> {
+            Intent intent = new Intent(activity, StoryViewActivity.class);
+            ArrayList<String> urls = new ArrayList<>();
+            ArrayList<String> titles = new ArrayList<>();
+            ArrayList<String> storyIds = new ArrayList<>();
+            ArrayList<String> mimeTypes = new ArrayList<>();
+            final long twentyFourHoursAgo = System.currentTimeMillis() - 86400000;
+            final List<Story> contactStories = new ArrayList<>();
+            for (Story s : activity.xmppConnectionService.getStories()) {
+                if (s.getContact().asBareJid().equals(story.getContact().asBareJid())
+                        && s.getPublished() >= twentyFourHoursAgo) {
+                    contactStories.add(s);
+                }
+            }
+            // Show oldest first so the viewer plays them in chronological order
+            contactStories.sort((a, b) -> Long.compare(a.getPublished(), b.getPublished()));
+            for (Story s : contactStories) {
+                urls.add(s.getUrl());
+                titles.add(s.getTitle());
+                storyIds.add(s.getUuid());
+                mimeTypes.add(s.getType());
+            }
+            intent.putStringArrayListExtra(StoryViewActivity.EXTRA_URLS, urls);
+            intent.putStringArrayListExtra(StoryViewActivity.EXTRA_TITLES, titles);
+            intent.putStringArrayListExtra(StoryViewActivity.EXTRA_STORY_IDS, storyIds);
+            intent.putStringArrayListExtra(StoryViewActivity.EXTRA_MIME_TYPES, mimeTypes);
+            intent.putExtra(StoryViewActivity.EXTRA_CONTACT, story.getContact().asBareJid().toString());
+            if (finalStoryAccount != null) {
+                intent.putExtra(StoryViewActivity.EXTRA_ACCOUNT, finalStoryAccount.getUuid());
+            }
+            activity.startActivity(intent);
+        });
+    }
+
+    @Override
+    public int getItemCount() {
+        return stories.size();
+    }
+
+    static class StoryViewHolder extends RecyclerView.ViewHolder {
+
+        final ImageView storyImage;
+        final TextView storyTitle;
+        final TextView storyTime;
+        final ImageView storyPreview;
+
+        StoryViewHolder(@NonNull View itemView) {
+            super(itemView);
+            storyImage = itemView.findViewById(R.id.story_image);
+            storyTitle = itemView.findViewById(R.id.story_title);
+            storyTime = itemView.findViewById(R.id.story_time);
+            storyPreview = itemView.findViewById(R.id.story_preview);
+        }
+    }
+
+    @Override
+    public void onAttachedToRecyclerView(@NonNull RecyclerView recyclerView) {
+        super.onAttachedToRecyclerView(recyclerView);
+        this.recyclerView = recyclerView;
+        handler.post(refreshRunnable);
+    }
+
+    @Override
+    public void onDetachedFromRecyclerView(@NonNull RecyclerView recyclerView) {
+        super.onDetachedFromRecyclerView(recyclerView);
+        handler.removeCallbacks(refreshRunnable);
+        this.recyclerView = null;
+    }
+}

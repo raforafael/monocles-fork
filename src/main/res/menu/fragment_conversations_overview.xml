@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+    <item
+        android:id="@+id/action_search"
+        android:icon="@drawable/ic_search_24dp"
+        android:orderInCategory="1"
+        android:title="@string/search_messages"
+        android:visible="@bool/show_individual_search_options"
+        app:showAsAction="ifRoom" />
+    <item
+        android:id="@+id/action_note_to_self"
+        android:orderInCategory="80"
+        android:title="@string/note_to_self"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_easy_invite"
+        android:icon="@drawable/ic_person_add_24dp"
+        android:orderInCategory="89"
+        android:title="@string/invite_to_app"
+        app:showAsAction="ifRoom" />
+    <item
+        android:id="@+id/action_feeds"
+        android:orderInCategory="90"
+        android:title="@string/feeds"
+        android:icon="@drawable/outline_newspaper_24"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_accounts"
+        android:orderInCategory="91"
+        android:title="@string/action_accounts"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_account"
+        android:orderInCategory="91"
+        android:title="@string/action_account"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_media_gallery"
+        android:orderInCategory="92"
+        android:title="@string/media_gallery"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_stories"
+        android:orderInCategory="93"
+        android:title="@string/stories"
+        android:icon="@drawable/outline_stories_24"
+        app:showAsAction="ifRoom" />
+    <item
+        android:id="@+id/action_calls"
+        android:orderInCategory="94"
+        android:title="@string/calls"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_privacy_policy"
+        android:orderInCategory="98"
+        android:title="@string/privacy_policy"
+        android:visible="false"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/action_settings"
+        android:orderInCategory="100"
+        android:title="@string/action_settings"
+        app:showAsAction="never" />
+</menu>

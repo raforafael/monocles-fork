@@ -1,0 +1,2308 @@
+package eu.siacs.conversations.ui;
+
+import android.app.Activity;
+import android.app.KeyguardManager;
+import android.app.PendingIntent;
+import android.content.ActivityNotFoundException;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentSender;
+import android.content.SharedPreferences;
+import android.graphics.Bitmap;
+import android.graphics.drawable.ColorDrawable;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.preference.PreferenceManager;
+import android.provider.Settings;
+import android.security.KeyChain;
+import android.security.KeyChainAliasCallback;
+import android.text.Editable;
+import android.text.TextUtils;
+import android.text.TextWatcher;
+import android.util.Log;
+import android.view.DragEvent;
+import android.view.Menu;
+import android.view.MenuItem;
+import android.view.MotionEvent;
+import android.view.View;
+import android.view.View.OnClickListener;
+import android.view.ViewGroup;
+import android.widget.AdapterView;
+import android.widget.ArrayAdapter;
+import android.widget.CheckBox;
+import android.widget.CompoundButton.OnCheckedChangeListener;
+import android.widget.EditText;
+import android.widget.ImageView;
+import android.widget.Spinner;
+import android.widget.TextView;
+import android.widget.Toast;
+import androidx.annotation.NonNull;
+import androidx.appcompat.app.ActionBar;
+import androidx.appcompat.app.AlertDialog;
+import androidx.databinding.DataBindingUtil;
+import androidx.lifecycle.Lifecycle;
+import com.google.android.material.color.MaterialColors;
+import com.google.android.material.dialog.MaterialAlertDialogBuilder;
+import com.google.android.material.textfield.TextInputLayout;
+import com.google.common.base.CharMatcher;
+import com.google.common.base.Strings;
+
+import com.rarepebble.colorpicker.ColorPickerView;
+
+import org.openintents.openpgp.util.OpenPgpUtils;
+
+import java.text.DateFormat;
+import java.util.Arrays;
+import java.util.Calendar;
+import java.util.Date;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import eu.siacs.conversations.AppSettings;
+import eu.siacs.conversations.Config;
+import eu.siacs.conversations.R;
+import eu.siacs.conversations.crypto.axolotl.AxolotlService;
+import eu.siacs.conversations.crypto.axolotl.FingerprintStatus;
+import eu.siacs.conversations.crypto.axolotl.XmppAxolotlSession;
+import eu.siacs.conversations.databinding.ActivityEditAccountBinding;
+import eu.siacs.conversations.databinding.DialogPresenceBinding;
+import eu.siacs.conversations.entities.Account;
+import eu.siacs.conversations.entities.Presence;
+import eu.siacs.conversations.entities.PresenceTemplate;
+import eu.siacs.conversations.services.BarcodeProvider;
+import eu.siacs.conversations.services.QuickConversationsService;
+import eu.siacs.conversations.services.XmppConnectionService;
+import eu.siacs.conversations.services.XmppConnectionService.OnAccountUpdate;
+import eu.siacs.conversations.services.XmppConnectionService.OnCaptchaRequested;
+import eu.siacs.conversations.ui.TimePreference;
+import eu.siacs.conversations.ui.adapter.KnownHostsAdapter;
+import eu.siacs.conversations.ui.adapter.PresenceTemplateAdapter;
+import eu.siacs.conversations.ui.util.AvatarWorkerTask;
+import eu.siacs.conversations.ui.util.MenuDoubleTabUtil;
+import eu.siacs.conversations.ui.util.PendingItem;
+import eu.siacs.conversations.ui.util.SoftKeyboardUtils;
+import eu.siacs.conversations.utils.Compatibility;
+import eu.siacs.conversations.utils.CryptoHelper;
+import eu.siacs.conversations.utils.Resolver;
+import eu.siacs.conversations.utils.SignupUtils;
+import eu.siacs.conversations.utils.TorServiceUtils;
+import eu.siacs.conversations.utils.UIHelper;
+import eu.siacs.conversations.utils.XmppUri;
+import eu.siacs.conversations.xml.Element;
+import eu.siacs.conversations.xml.Namespace;
+import eu.siacs.conversations.xmpp.Jid;
+import eu.siacs.conversations.xmpp.OnKeyStatusUpdated;
+import eu.siacs.conversations.xmpp.OnUpdateBlocklist;
+import eu.siacs.conversations.xmpp.XmppConnection;
+import eu.siacs.conversations.xmpp.XmppConnection.Features;
+import eu.siacs.conversations.xmpp.forms.Data;
+import android.view.LayoutInflater;
+import eu.siacs.conversations.xmpp.pep.Avatar;
+import java.util.Collection;
+
+import static eu.siacs.conversations.utils.PermissionUtils.allGranted;
+import static eu.siacs.conversations.utils.PermissionUtils.writeGranted;
+
+import okhttp3.HttpUrl;
+import okhttp3.HttpUrl;
+import org.openintents.openpgp.util.OpenPgpUtils;
+import org.openintents.openpgp.util.OpenPgpUtils;
+
+import java.util.Arrays;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class EditAccountActivity extends OmemoActivity
+        implements OnAccountUpdate,
+        OnUpdateBlocklist,
+        OnKeyStatusUpdated,
+        OnCaptchaRequested,
+        KeyChainAliasCallback,
+        XmppConnectionService.OnShowErrorToast,
+        XmppConnectionService.OnMamPreferencesFetched {
+
+    public static final String EXTRA_OPENED_FROM_NOTIFICATION = "opened_from_notification";
+    public static final String EXTRA_FORCE_REGISTER = "force_register";
+
+    private static final int REQUEST_IMPORT_BACKUP = 0x63fb;
+    private static final int REQUEST_DATA_SAVER = 0xf244;
+    private static final int REQUEST_CHANGE_STATUS = 0xee11;
+    private static final int REQUEST_ORBOT = 0xff22;
+    private static final int REQUEST_UNLOCK = 0xff23;
+    private final PendingItem<PresenceTemplate> mPendingPresenceTemplate = new PendingItem<>();
+    private AlertDialog mCaptchaDialog = null;
+    private Jid jidToEdit;
+    private boolean mInitMode = false;
+    private Boolean mForceRegister = null;
+    private boolean mUsernameMode = false;
+    private boolean mShowOptions = false;
+    private Account mAccount;
+
+    // Supported VCard4 fields based on what ContactDetailsActivity supports
+    private static final String[] VCARD_TYPES = {"fn", "xmpp", "org", "title", "role", "url", "note", "tel", "email", "taler", "other"};
+    private boolean mVCardModified = false;
+    private boolean mIsLoadingVCard = false;
+
+    private final OnClickListener mCancelButtonClickListener =
+            v -> {
+                deleteAccountAndReturnIfNecessary();
+                finish();
+            };
+    private final UiCallback<Avatar> mAvatarFetchCallback =
+            new UiCallback<Avatar>() {
+
+                @Override
+                public void userInputRequired(final PendingIntent pi, final Avatar avatar) {
+                    finishInitialSetup(avatar);
+                }
+
+                @Override
+                public void success(final Avatar avatar) {
+                    finishInitialSetup(avatar);
+                }
+
+                @Override
+                public void error(final int errorCode, final Avatar avatar) {
+                    finishInitialSetup(avatar);
+                }
+            };
+    private final OnClickListener mAvatarClickListener =
+            new OnClickListener() {
+                @Override
+                public void onClick(final View view) {
+                    if (mAccount != null) {
+                        final Intent intent =
+                                new Intent(
+                                        getApplicationContext(),
+                                        PublishProfilePictureActivity.class);
+                        intent.putExtra(EXTRA_ACCOUNT, mAccount.getJid().asBareJid().toString());
+                        startActivity(intent);
+                    }
+                }
+            };
+    private String messageFingerprint;
+    private boolean mFetchingAvatar = false;
+    private Toast mFetchingMamPrefsToast;
+    private String mSavedInstanceAccount;
+    private boolean mSavedInstanceInit = false;
+    private XmppUri pendingUri = null;
+    private boolean mUseTor;
+    private boolean mUseI2P;
+    private ActivityEditAccountBinding binding;
+    private final OnClickListener mSaveButtonClickListener =
+            new OnClickListener() {
+
+                @Override
+                public void onClick(final View v) {
+                    final String password = binding.accountPassword.getText().toString();
+                    final boolean wasDisabled =
+                            mAccount != null && mAccount.getStatus() == Account.State.DISABLED;
+                    final boolean accountInfoEdited = accountInfoEdited();
+                    saveVCardData();
+                    mVCardModified = false; // Reset flag
+                    refreshUi();
+                    ColorDrawable previewColor = (ColorDrawable) binding.colorPreview.getBackground();
+                    if (previewColor != null && previewColor.getColor() != mAccount.getColor(isDark())) {
+                        mAccount.setColor(previewColor.getColor());
+                    }
+
+                    if (mInitMode && mAccount != null) {
+                        mAccount.setOption(Account.OPTION_DISABLED, false);
+                    }
+                    if (mAccount != null
+                            && Arrays.asList(Account.State.DISABLED, Account.State.LOGGED_OUT)
+                            .contains(mAccount.getStatus())
+                            && !accountInfoEdited) {
+                        mAccount.setOption(Account.OPTION_SOFT_DISABLED, false);
+                        mAccount.setOption(Account.OPTION_DISABLED, false);
+                        if (!xmppConnectionService.updateAccount(mAccount)) {
+                            Toast.makeText(
+                                            EditAccountActivity.this,
+                                            R.string.unable_to_update_account,
+                                            Toast.LENGTH_SHORT)
+                                    .show();
+                        }
+                        return;
+                    }
+                    final boolean registerNewAccount;
+                    if (mForceRegister != null) {
+                        registerNewAccount = mForceRegister;
+                    } else {
+                        registerNewAccount =
+                                binding.accountRegisterNew.isChecked()
+                                        && !Config.DISALLOW_REGISTRATION_IN_UI;
+                    }
+                    if (mUsernameMode && binding.accountJid.getText().toString().contains("@")) {
+                        binding.accountJidLayout.setError(getString(R.string.invalid_username));
+                        removeErrorsOnAllBut(binding.accountJidLayout);
+                        binding.accountJid.requestFocus();
+                        return;
+                    }
+
+                    XmppConnection connection =
+                            mAccount == null ? null : mAccount.getXmppConnection();
+                    final boolean startOrbot =
+                            mAccount != null
+                                    && mAccount.getStatus() == Account.State.TOR_NOT_AVAILABLE;
+                    final boolean startI2P =
+                            mAccount != null
+                                    && mAccount.getStatus() == Account.State.I2P_NOT_AVAILABLE;
+                    if (startOrbot) {
+                        if (TorServiceUtils.isOrbotInstalled(EditAccountActivity.this)) {
+                            TorServiceUtils.startOrbot(EditAccountActivity.this, REQUEST_ORBOT);
+                        } else {
+                            TorServiceUtils.downloadOrbot(EditAccountActivity.this, REQUEST_ORBOT);
+                        }
+                        return;
+                    }
+
+
+                    if (startI2P) {
+                        return; // just exit
+                    }
+
+                    if (inNeedOfSaslAccept()) {
+                        mAccount.resetPinnedMechanism();
+                        if (!xmppConnectionService.updateAccount(mAccount)) {
+                            Toast.makeText(
+                                            EditAccountActivity.this,
+                                            R.string.unable_to_update_account,
+                                            Toast.LENGTH_SHORT)
+                                    .show();
+                        }
+                        return;
+                    }
+
+                    final boolean openRegistrationUrl =
+                            registerNewAccount
+                                    && !accountInfoEdited
+                                    && mAccount != null
+                                    && mAccount.getStatus() == Account.State.REGISTRATION_WEB;
+                    final boolean openPaymentUrl =
+                            mAccount != null
+                                    && mAccount.getStatus() == Account.State.PAYMENT_REQUIRED;
+                    final boolean redirectionWorthyStatus = openPaymentUrl || openRegistrationUrl;
+                    final HttpUrl url =
+                            connection != null && redirectionWorthyStatus
+                                    ? connection.getRedirectionUrl()
+                                    : null;
+                    if (url != null && !wasDisabled) {
+                        try {
+                            startActivity(
+                                    new Intent(Intent.ACTION_VIEW, Uri.parse(url.toString())));
+                            return;
+                        } catch (ActivityNotFoundException e) {
+                            Toast.makeText(
+                                            EditAccountActivity.this,
+                                            R.string.application_found_to_open_website,
+                                            Toast.LENGTH_SHORT)
+                                    .show();
+                            return;
+                        }
+                    }
+
+                    final Jid jid;
+                    try {
+                        if (mUsernameMode) {
+                            jid =
+                                    Jid.of(
+                                            binding.accountJid.getText().toString(),
+                                            getUserModeDomain(),
+                                            null);
+                        } else {
+                            jid = Jid.ofUserInput(binding.accountJid.getText().toString());
+                            Resolver.checkDomain(jid);
+                        }
+                    } catch (final NullPointerException | IllegalArgumentException e) {
+                        if (mUsernameMode) {
+                            binding.accountJidLayout.setError(getString(R.string.invalid_username));
+                        } else {
+                            binding.accountJidLayout.setError(getString(R.string.invalid_jid));
+                        }
+                        binding.accountJid.requestFocus();
+                        removeErrorsOnAllBut(binding.accountJidLayout);
+                        return;
+                    }
+                    final String hostname;
+                    int numericPort = 5222;
+                    if (mShowOptions) {
+                        hostname = CharMatcher.whitespace().removeFrom(binding.hostname.getText());
+                        final String port =
+                                CharMatcher.whitespace().removeFrom(binding.port.getText());
+                        if (Resolver.invalidHostname(hostname)) {
+                            binding.hostnameLayout.setError(getString(R.string.not_valid_hostname));
+                            binding.hostname.requestFocus();
+                            removeErrorsOnAllBut(binding.hostnameLayout);
+                            return;
+                        }
+                        if (!hostname.isEmpty()) {
+                            try {
+                                numericPort = Integer.parseInt(port);
+                                if (numericPort < 0 || numericPort > 65535) {
+                                    binding.portLayout.setError(
+                                            getString(R.string.not_a_valid_port));
+                                    removeErrorsOnAllBut(binding.portLayout);
+                                    binding.port.requestFocus();
+                                    return;
+                                }
+
+                            } catch (NumberFormatException e) {
+                                binding.portLayout.setError(getString(R.string.not_a_valid_port));
+                                removeErrorsOnAllBut(binding.portLayout);
+                                binding.port.requestFocus();
+                                return;
+                            }
+                        }
+                    } else {
+                        hostname = null;
+                    }
+
+                    if (jid.getLocal() == null) {
+                        if (mUsernameMode) {
+                            binding.accountJidLayout.setError(getString(R.string.invalid_username));
+                        } else {
+                            binding.accountJidLayout.setError(getString(R.string.invalid_jid));
+                        }
+                        removeErrorsOnAllBut(binding.accountJidLayout);
+                        binding.accountJid.requestFocus();
+                        return;
+                    }
+                    if (mAccount != null) {
+                        if (mAccount.isOptionSet(Account.OPTION_MAGIC_CREATE)) {
+                            mAccount.setOption(
+                                    Account.OPTION_MAGIC_CREATE,
+                                    mAccount.getPassword().contains(password));
+                        }
+                        mAccount.setJid(jid);
+                        mAccount.setPort(numericPort);
+                        mAccount.setHostname(hostname);
+                        binding.accountJidLayout.setError(null);
+                        mAccount.setPassword(password);
+                        mAccount.setOption(Account.OPTION_REGISTER, registerNewAccount);
+                        if (!xmppConnectionService.updateAccount(mAccount)) {
+                            Toast.makeText(
+                                            EditAccountActivity.this,
+                                            R.string.unable_to_update_account,
+                                            Toast.LENGTH_SHORT)
+                                    .show();
+                            return;
+                        }
+                    } else {
+                        if (xmppConnectionService.findAccountByJid(jid) != null) {
+                            binding.accountJidLayout.setError(
+                                    getString(R.string.account_already_exists));
+                            removeErrorsOnAllBut(binding.accountJidLayout);
+                            binding.accountJid.requestFocus();
+                            return;
+                        }
+                        mAccount = new Account(jid.asBareJid(), password);
+                        mAccount.setPort(numericPort);
+                        mAccount.setHostname(hostname);
+                        mAccount.setOption(Account.OPTION_REGISTER, registerNewAccount);
+                        xmppConnectionService.createAccount(mAccount);
+                    }
+                    binding.hostnameLayout.setError(null);
+                    binding.portLayout.setError(null);
+                    if (mAccount.isOnion()) {
+                        Toast.makeText(
+                                        EditAccountActivity.this,
+                                        R.string.audio_video_disabled_tor,
+                                        Toast.LENGTH_LONG)
+                                .show();
+                    }
+                    if (mAccount.isEnabled() && !registerNewAccount && !mInitMode) {
+                        finish();
+                    } else {
+                        updateSaveButton();
+                        updateAccountInformation(true);
+                    }
+                }
+            };
+    private final TextWatcher mTextWatcher =
+            new TextWatcher() {
+
+                @Override
+                public void onTextChanged(
+                        final CharSequence s, final int start, final int before, final int count) {
+                    updatePortLayout();
+                    updateSaveButton();
+                }
+
+                @Override
+                public void beforeTextChanged(
+                        final CharSequence s, final int start, final int count, final int after) {}
+
+                @Override
+                public void afterTextChanged(final Editable s) {}
+            };
+    private final View.OnFocusChangeListener mEditTextFocusListener =
+            new View.OnFocusChangeListener() {
+                @Override
+                public void onFocusChange(View view, boolean b) {
+                    EditText et = (EditText) view;
+                    if (b) {
+                        int resId =
+                                mUsernameMode
+                                        ? R.string.username
+                                        : R.string.account_settings_example_jabber_id;
+                        if (view.getId() == R.id.hostname) {
+                            resId =
+                                    mUseTor
+                                            ? R.string.hostname_or_onion
+                                            : R.string.hostname_example;
+                        }
+                        final int res = resId;
+                        new Handler().postDelayed(() -> et.setHint(res), 200);
+                    } else {
+                        et.setHint(null);
+                    }
+                }
+            };
+
+    private static void setAvailabilityRadioButton(
+            Presence.Status status, DialogPresenceBinding binding) {
+        if (status == null) {
+            binding.online.setChecked(true);
+            return;
+        }
+        switch (status) {
+            case DND:
+                binding.dnd.setChecked(true);
+                break;
+            case XA:
+                binding.xa.setChecked(true);
+                break;
+            case AWAY:
+                binding.away.setChecked(true);
+                break;
+            default:
+                binding.online.setChecked(true);
+        }
+    }
+
+    private static Presence.Status getAvailabilityRadioButton(DialogPresenceBinding binding) {
+        if (binding.dnd.isChecked()) {
+            return Presence.Status.DND;
+        } else if (binding.xa.isChecked()) {
+            return Presence.Status.XA;
+        } else if (binding.away.isChecked()) {
+            return Presence.Status.AWAY;
+        } else {
+            return Presence.Status.ONLINE;
+        }
+    }
+
+    public void refreshUiReal() {
+        invalidateOptionsMenu();
+        if (mAccount != null && mAccount.getStatus() != Account.State.ONLINE && mFetchingAvatar) {
+            Intent intent = new Intent(this, StartConversationActivity.class);
+            StartConversationActivity.addInviteUri(intent, getIntent());
+            startActivity(intent);
+            finish();
+        } else if (mInitMode && mAccount != null && mAccount.getStatus() == Account.State.ONLINE) {
+            if (!mFetchingAvatar) {
+                mFetchingAvatar = true;
+                xmppConnectionService.checkForAvatar(mAccount, mAvatarFetchCallback);
+            }
+        }
+        if (mAccount != null) {
+            updateAccountInformation(false);
+        }
+        updateSaveButton();
+    }
+
+    @Override
+    public boolean onNavigateUp() {
+        deleteAccountAndReturnIfNecessary();
+        return super.onNavigateUp();
+    }
+
+    @Override
+    public void onBackPressed() {
+        deleteAccountAndReturnIfNecessary();
+        super.onBackPressed();
+    }
+
+    private void deleteAccountAndReturnIfNecessary() {
+        if (mInitMode
+                && mAccount != null
+                && !mAccount.isOptionSet(Account.OPTION_LOGGED_IN_SUCCESSFULLY)) {
+            xmppConnectionService.deleteAccount(mAccount);
+        }
+
+        final boolean magicCreate =
+                mAccount != null
+                        && mAccount.isOptionSet(Account.OPTION_MAGIC_CREATE)
+                        && !mAccount.isOptionSet(Account.OPTION_LOGGED_IN_SUCCESSFULLY);
+        final Jid jid = mAccount == null ? null : mAccount.getJid();
+
+        if (SignupUtils.isSupportTokenRegistry()
+                && jid != null
+                && magicCreate
+                && !jid.getDomain().equals(Config.MAGIC_CREATE_DOMAIN)) {
+            final Jid preset;
+            if (mAccount.isOptionSet(Account.OPTION_FIXED_USERNAME)) {
+                preset = jid.asBareJid();
+            } else {
+                preset = jid.getDomain();
+            }
+            final Intent intent =
+                    SignupUtils.getTokenRegistrationIntent(
+                            this, preset, mAccount.getKey(Account.KEY_PRE_AUTH_REGISTRATION_TOKEN));
+            StartConversationActivity.addInviteUri(intent, getIntent());
+            startActivity(intent);
+            return;
+        }
+
+        final List<Account> accounts =
+                xmppConnectionService == null ? null : xmppConnectionService.getAccounts();
+        if (accounts != null && accounts.size() == 0 && Config.MAGIC_CREATE_DOMAIN != null) {
+            Intent intent =
+                    SignupUtils.getSignUpIntent(this, mForceRegister != null && mForceRegister);
+            StartConversationActivity.addInviteUri(intent, getIntent());
+            startActivity(intent);
+        }
+    }
+
+    @Override
+    public void onAccountUpdate() {
+        refreshUi();
+    }
+
+    protected void finishInitialSetup(final Avatar avatar) {
+        runOnUiThread(
+                () -> {
+                    SoftKeyboardUtils.hideSoftKeyboard(EditAccountActivity.this);
+                    final Intent intent;
+                    final XmppConnection connection = mAccount.getXmppConnection();
+                    final boolean wasFirstAccount =
+                            xmppConnectionService != null
+                                    && xmppConnectionService.getAccounts().size() == 1;
+                    if (avatar != null || (connection != null && !connection.getFeatures().pep())) {
+                        intent =
+                                new Intent(
+                                        getApplicationContext(), StartConversationActivity.class);
+                        intent.putExtra("init", true);
+                        intent.putExtra(
+                                EXTRA_ACCOUNT, mAccount.getJid().asBareJid().toString());
+                    } else {
+                        intent =
+                                new Intent(
+                                        getApplicationContext(),
+                                        PublishProfilePictureActivity.class);
+                        intent.putExtra(EXTRA_ACCOUNT, mAccount.getJid().asBareJid().toString());
+                        intent.putExtra("setup", true);
+                    }
+                    if (wasFirstAccount) {
+                        intent.setFlags(
+                                Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+                    }
+                    StartConversationActivity.addInviteUri(intent, getIntent());
+                    startActivity(intent);
+                    finish();
+                });
+    }
+
+    @Override
+    public void onActivityResult(int requestCode, int resultCode, Intent data) {
+        // TODO check for Camera / Scan permission
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_BATTERY_OP || requestCode == REQUEST_DATA_SAVER) {
+            updateAccountInformation(mAccount == null);
+        }
+        if (requestCode == REQUEST_BATTERY_OP) {
+            // the result code is always 0 even when battery permission were granted
+            XmppConnectionService.toggleForegroundService(xmppConnectionService);
+        }
+        if (requestCode == REQUEST_CHANGE_STATUS) {
+            PresenceTemplate template = mPendingPresenceTemplate.pop();
+            if (template != null && resultCode == Activity.RESULT_OK) {
+                generateSignature(data, template);
+            } else {
+                Log.d(Config.LOGTAG, "pgp result not ok");
+            }
+        }
+        if (requestCode == REQUEST_UNLOCK) {
+            if (resultCode == RESULT_OK) {
+                openChangePassword(true);
+            }
+        }
+    }
+
+    @Override
+    protected void processFingerprintVerification(XmppUri uri) {
+        processFingerprintVerification(uri, true);
+    }
+
+    protected void processFingerprintVerification(XmppUri uri, boolean showWarningToast) {
+        if (mAccount != null
+                && mAccount.getJid().asBareJid().equals(uri.getJid())
+                && uri.hasFingerprints()) {
+            if (xmppConnectionService.verifyFingerprints(mAccount, uri.getFingerprints())) {
+                Toast.makeText(this, R.string.verified_fingerprints, Toast.LENGTH_SHORT).show();
+                updateAccountInformation(false);
+            }
+        } else if (showWarningToast) {
+            Toast.makeText(this, R.string.invalid_barcode, Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void updatePortLayout() {
+        final String hostname = this.binding.hostname.getText().toString();
+        if (TextUtils.isEmpty(hostname)) {
+            this.binding.portLayout.setEnabled(false);
+            this.binding.portLayout.setError(null);
+        } else {
+            this.binding.portLayout.setEnabled(true);
+        }
+    }
+
+    protected void updateSaveButton() {
+        boolean accountInfoEdited = accountInfoEdited();
+
+        if (accountInfoEdited && !mInitMode) {
+            this.binding.saveButton.setText(R.string.save);
+            this.binding.saveButton.setEnabled(true);
+        } else if (mAccount != null
+                && (mAccount.getStatus() == Account.State.CONNECTING
+                || mAccount.getStatus() == Account.State.REGISTRATION_SUCCESSFUL
+                || mFetchingAvatar)) {
+            this.binding.saveButton.setEnabled(false);
+            this.binding.saveButton.setText(R.string.account_status_connecting);
+        } else if (mAccount != null
+                && mAccount.getStatus() == Account.State.DISABLED
+                && !mInitMode) {
+            this.binding.saveButton.setEnabled(true);
+            this.binding.saveButton.setText(R.string.enable);
+        } else if (torNeedsInstall(mAccount)) {
+            this.binding.saveButton.setEnabled(true);
+            this.binding.saveButton.setText(R.string.install_orbot);
+        } else if (torNeedsStart(mAccount)) {
+            this.binding.saveButton.setEnabled(true);
+            this.binding.saveButton.setText(R.string.start_orbot);
+        } else {
+            this.binding.saveButton.setEnabled(true);
+            if (!mInitMode) {
+                if (mAccount != null && mAccount.isOnlineAndConnected()) {
+                    this.binding.saveButton.setText(R.string.save);
+                    if (!accountInfoEdited) {
+                        this.binding.saveButton.setEnabled(false);
+                    }
+                } else {
+                    XmppConnection connection =
+                            mAccount == null ? null : mAccount.getXmppConnection();
+                    HttpUrl url =
+                            connection != null
+                                    && mAccount.getStatus()
+                                    == Account.State.PAYMENT_REQUIRED
+                                    ? connection.getRedirectionUrl()
+                                    : null;
+                    if (url != null) {
+                        this.binding.saveButton.setText(R.string.open_website);
+                    } else if (inNeedOfSaslAccept()) {
+                        this.binding.saveButton.setText(R.string.accept);
+                    } else {
+                        this.binding.saveButton.setText(R.string.connect);
+                    }
+                }
+            } else {
+                XmppConnection connection = mAccount == null ? null : mAccount.getXmppConnection();
+                HttpUrl url =
+                        connection != null && mAccount.getStatus() == Account.State.REGISTRATION_WEB
+                                ? connection.getRedirectionUrl()
+                                : null;
+                if (url != null
+                        && this.binding.accountRegisterNew.isChecked()
+                        && !accountInfoEdited) {
+                    this.binding.saveButton.setText(R.string.open_website);
+                } else {
+                    this.binding.saveButton.setText(R.string.next);
+                }
+            }
+        }
+    }
+
+    private boolean torNeedsInstall(final Account account) {
+        return account != null
+                && account.getStatus() == Account.State.TOR_NOT_AVAILABLE
+                && !TorServiceUtils.isOrbotInstalled(this);
+    }
+
+    private boolean torNeedsStart(final Account account) {
+        return account != null && account.getStatus() == Account.State.TOR_NOT_AVAILABLE;
+    }
+
+    protected boolean accountInfoEdited() {
+        if (this.mAccount == null) {
+            return false;
+        }
+        ColorDrawable previewColor = (ColorDrawable) binding.colorPreview.getBackground();
+        return jidEdited()
+                || !this.mAccount
+                .getPassword()
+                .equals(this.binding.accountPassword.getText().toString())
+                || !this.mAccount.getHostname().equals(this.binding.hostname.getText().toString())
+                || this.mAccount.getColor(isDark()) != (previewColor == null ? 0 : previewColor.getColor())
+                || !String.valueOf(this.mAccount.getPort())
+                .equals(this.binding.port.getText().toString())
+                || mVCardModified;
+    }
+
+    protected boolean jidEdited() {
+        final String unmodified;
+        if (mUsernameMode) {
+            unmodified = this.mAccount.getJid().getLocal();
+        } else {
+            unmodified = this.mAccount.getJid().asBareJid().toString();
+        }
+        return !unmodified.equals(this.binding.accountJid.getText().toString());
+    }
+
+    @Override
+    protected String getShareableUri(boolean http) {
+        if (mAccount != null) {
+            return http ? mAccount.getShareableLink() : mAccount.getShareableUri();
+        } else {
+            return null;
+        }
+    }
+
+    @Override
+    protected void onCreate(final Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        if (savedInstanceState != null) {
+            this.mSavedInstanceAccount = savedInstanceState.getString("account");
+            this.mSavedInstanceInit = savedInstanceState.getBoolean("initMode", false);
+        }
+        this.binding = DataBindingUtil.setContentView(this, R.layout.activity_edit_account);
+        Activities.setStatusAndNavigationBarColors(this, binding.getRoot());
+        setSupportActionBar(binding.toolbar);
+        binding.accountJid.addTextChangedListener(this.mTextWatcher);
+        binding.accountJid.setOnFocusChangeListener(this.mEditTextFocusListener);
+        this.binding.accountPassword.addTextChangedListener(this.mTextWatcher);
+
+        this.binding.avater.setOnClickListener(this.mAvatarClickListener);
+        this.binding.hostname.addTextChangedListener(mTextWatcher);
+        this.binding.hostname.setOnFocusChangeListener(mEditTextFocusListener);
+        this.binding.clearDevices.setOnClickListener(v -> showWipePepDialog());
+        this.binding.port.setText(String.valueOf(Resolver.XMPP_PORT_STARTTLS));
+        this.binding.port.addTextChangedListener(mTextWatcher);
+        this.binding.saveButton.setOnClickListener(this.mSaveButtonClickListener);
+        this.binding.cancelButton.setOnClickListener(this.mCancelButtonClickListener);
+        if (savedInstanceState != null && savedInstanceState.getBoolean("showMoreTable")) {
+            changeMoreTableVisibility(true);
+        }
+        final OnCheckedChangeListener OnCheckedShowConfirmPassword =
+                (buttonView, isChecked) -> updateSaveButton();
+        this.binding.accountRegisterNew.setOnCheckedChangeListener(OnCheckedShowConfirmPassword);
+        if (Config.DISALLOW_REGISTRATION_IN_UI) {
+            this.binding.accountRegisterNew.setVisibility(View.GONE);
+        }
+        this.binding.actionEditYourName.setOnClickListener(this::onEditYourNameClicked);
+        binding.accountColorBox.setOnClickListener((v) -> {
+            showColorDialog();
+        });
+        binding.btnAddProfileItem.setOnClickListener(v -> {
+            addVCardRow("org", ""); // Default type
+            mVCardModified = true; // Mark as modified
+            refreshUi(); // Refresh button state
+        });
+        binding.btnShowQrCode.setOnClickListener(v -> {
+            String vcardString = generateVCardString();
+            if (vcardString != null && !vcardString.isEmpty()) {
+                showQrCodeDialog(vcardString);
+            } else {
+                Toast.makeText(this, "No profile data to generate QR", Toast.LENGTH_SHORT).show();
+            }
+        });
+        final var preferences = getPreferences();
+        binding.quietHoursEnable.setOnClickListener((v) -> {
+            preferences.edit().putBoolean("enable_quiet_hours:" + mAccount.getUuid(), binding.quietHoursEnable.isChecked()).apply();
+            updateAccountInformation(false);
+        });
+        binding.quietHoursStartBox.setOnClickListener((v) -> {
+            final var picker = new com.google.android.material.timepicker.MaterialTimePicker.Builder()
+                    .setTitleText("Quiet Hours Start")
+                    .setHour((int)(preferences.getLong("quiet_hours_start:" + mAccount.getUuid(), 1320) / 60))
+                    .setMinute((int)(preferences.getLong("quiet_hours_start:" + mAccount.getUuid(), 1320) % 60))
+                    .build();
+            picker.addOnPositiveButtonClickListener((v2) -> {
+                preferences.edit().putLong("quiet_hours_start:" + mAccount.getUuid(), (picker.getHour() * 60) + picker.getMinute()).apply();
+                updateAccountInformation(false);
+            });
+            picker.show(getSupportFragmentManager(), "quiethoursstart");
+        });
+        binding.quietHoursEndBox.setOnClickListener((v) -> {
+            final var picker = new com.google.android.material.timepicker.MaterialTimePicker.Builder()
+                    .setTitleText("Quiet Hours End")
+                    .setHour((int)(preferences.getLong("quiet_hours_end:" + mAccount.getUuid(), 1320) / 60))
+                    .setMinute((int)(preferences.getLong("quiet_hours_end:" + mAccount.getUuid(), 1320) % 60))
+                    .build();
+            picker.addOnPositiveButtonClickListener((v2) -> {
+                preferences.edit().putLong("quiet_hours_end:" + mAccount.getUuid(), (picker.getHour() * 60) + picker.getMinute()).apply();
+                updateAccountInformation(false);
+            });
+            picker.show(getSupportFragmentManager(), "quiethoursend");
+        });
+        this.binding.scanButton.setOnClickListener((v) -> ScanActivity.scan(this));
+    }
+
+    private void onEditYourNameClicked(View view) {
+        quickEdit(
+                mAccount.getDisplayName(),
+                R.string.your_name,
+                value -> {
+                    final String displayName = value.trim();
+                    updateDisplayName(displayName);
+                    mAccount.setDisplayName(displayName);
+                    xmppConnectionService.publishDisplayName(mAccount);
+                    refreshAvatar();
+                    return null;
+                },
+                true);
+    }
+
+    private void refreshAvatar() {
+        AvatarWorkerTask.loadAvatar(
+                mAccount, binding.avater, R.dimen.avatar_on_details_screen_size);
+    }
+
+    @Override
+    public boolean onCreateOptionsMenu(final Menu menu) {
+        super.onCreateOptionsMenu(menu);
+        getMenuInflater().inflate(R.menu.editaccount, menu);
+        final MenuItem showBlocklist = menu.findItem(R.id.action_show_block_list);
+        final MenuItem showMoreInfo = menu.findItem(R.id.action_server_info_show_more);
+        final MenuItem changePassword = menu.findItem(R.id.action_change_password_on_server);
+        final MenuItem deleteAccount = menu.findItem(R.id.action_delete_account);
+        final MenuItem renewCertificate = menu.findItem(R.id.action_renew_certificate);
+        final MenuItem mamPrefs = menu.findItem(R.id.action_mam_prefs);
+        final MenuItem changePresence = menu.findItem(R.id.action_change_presence);
+        final MenuItem share = menu.findItem(R.id.action_share);
+        final MenuItem importBackup = menu.findItem(R.id.action_import_backup);
+        renewCertificate.setVisible(mAccount != null && mAccount.getPrivateKeyAlias() != null);
+
+        share.setVisible(mAccount != null && !mInitMode);
+        importBackup.setVisible(mAccount == null || mInitMode);
+
+        if (mAccount != null && mAccount.isOnlineAndConnected()) {
+            if (!mAccount.getXmppConnection().getFeatures().blocking()) {
+                showBlocklist.setVisible(false);
+            }
+
+            if (!mAccount.getXmppConnection().getFeatures().register()) {
+                changePassword.setVisible(false);
+                deleteAccount.setVisible(false);
+            }
+            mamPrefs.setVisible(mAccount.getXmppConnection().getFeatures().mam());
+            changePresence.setVisible(!mInitMode);
+        } else {
+            showBlocklist.setVisible(false);
+            showMoreInfo.setVisible(false);
+            changePassword.setVisible(false);
+            deleteAccount.setVisible(false);
+            mamPrefs.setVisible(false);
+            changePresence.setVisible(false);
+        }
+        return super.onCreateOptionsMenu(menu);
+    }
+
+    @Override
+    public boolean onPrepareOptionsMenu(Menu menu) {
+        final MenuItem showMoreInfo = menu.findItem(R.id.action_server_info_show_more);
+        if (showMoreInfo.isVisible()) {
+            showMoreInfo.setChecked(binding.serverInfoMore.getVisibility() == View.VISIBLE);
+        }
+        return super.onPrepareOptionsMenu(menu);
+    }
+
+    @Override
+    public void onStart() {
+        super.onStart();
+        final Intent intent = getIntent();
+        if (intent != null) {
+            try {
+                this.jidToEdit = Jid.of(intent.getStringExtra("jid"));
+            } catch (final IllegalArgumentException | NullPointerException ignored) {
+                this.jidToEdit = null;
+            }
+            final Uri data = intent.getData();
+            final XmppUri xmppUri = data == null ? null : new XmppUri(data);
+            final boolean scanned = intent.getBooleanExtra("scanned", false);
+            if (jidToEdit != null && xmppUri != null && xmppUri.hasFingerprints()) {
+                if (scanned) {
+                    if (xmppConnectionServiceBound) {
+                        processFingerprintVerification(xmppUri, false);
+                    } else {
+                        this.pendingUri = xmppUri;
+                    }
+                } else {
+                    displayVerificationWarningDialog(xmppUri);
+                }
+            }
+            boolean init = intent.getBooleanExtra("init", false);
+            boolean openedFromNotification =
+                    intent.getBooleanExtra(EXTRA_OPENED_FROM_NOTIFICATION, false);
+            Log.d(Config.LOGTAG, "extras " + intent.getExtras());
+            this.mForceRegister =
+                    intent.hasExtra(EXTRA_FORCE_REGISTER)
+                            ? intent.getBooleanExtra(EXTRA_FORCE_REGISTER, false)
+                            : null;
+            Log.d(Config.LOGTAG, "force register=" + mForceRegister);
+            this.mInitMode = init || this.jidToEdit == null;
+            this.messageFingerprint = intent.getStringExtra("fingerprint");
+            if (!mInitMode) {
+                this.binding.accountRegisterNew.setVisibility(View.GONE);
+                setTitle(getString(R.string.account_details));
+                configureActionBar(getSupportActionBar(), !openedFromNotification);
+            } else {
+                this.binding.avater.setVisibility(View.GONE);
+                this.binding.vcard.setVisibility(View.GONE);
+                configureActionBar(
+                        getSupportActionBar(), !(init && Config.MAGIC_CREATE_DOMAIN == null));
+                if (mForceRegister != null) {
+                    if (mForceRegister) {
+                        setTitle(R.string.register_new_account);
+                    } else {
+                        setTitle(R.string.add_existing_account);
+                    }
+                } else {
+                    setTitle(R.string.action_add_account);
+                }
+            }
+        }
+        SharedPreferences preferences = getPreferences();
+        mUseTor = preferences.getBoolean("use_tor", getResources().getBoolean(R.bool.use_tor));
+        mUseI2P = preferences.getBoolean("use_i2p", getResources().getBoolean(R.bool.use_i2p));
+        this.mShowOptions = mUseTor || mUseI2P || preferences.getBoolean("show_connection_options", getResources().getBoolean(R.bool.show_connection_options));
+        this.binding.namePort.setVisibility(mShowOptions ? View.VISIBLE : View.GONE);
+        if (mForceRegister != null) {
+            this.binding.accountRegisterNew.setVisibility(View.GONE);
+        }
+        if (intent.getBooleanExtra("snikket", false)) {
+            this.binding.accountJidLayout.setHint("Snikket Address");
+        }
+    }
+
+    private void displayVerificationWarningDialog(final XmppUri xmppUri) {
+        final MaterialAlertDialogBuilder builder = new MaterialAlertDialogBuilder(this);
+        builder.setTitle(R.string.verify_omemo2_keys);
+        View view = getLayoutInflater().inflate(R.layout.dialog_verify_fingerprints, null);
+        final CheckBox isTrustedSource = view.findViewById(R.id.trusted_source);
+        TextView warning = view.findViewById(R.id.warning);
+        warning.setText(R.string.verifying_omemo2_keys_trusted_source_account);
+        builder.setView(view);
+        builder.setPositiveButton(
+                R.string.continue_btn,
+                (dialog, which) -> {
+                    if (isTrustedSource.isChecked()) {
+                        processFingerprintVerification(xmppUri, false);
+                    } else {
+                        finish();
+                    }
+                });
+        builder.setNegativeButton(R.string.cancel, (dialog, which) -> finish());
+        final var dialog = builder.create();
+        dialog.setCanceledOnTouchOutside(false);
+        dialog.setOnCancelListener(d -> finish());
+        dialog.show();
+    }
+
+    @Override
+    public void onNewIntent(final Intent intent) {
+        super.onNewIntent(intent);
+        if (intent != null && intent.getData() != null) {
+            final XmppUri uri = new XmppUri(intent.getData());
+            if (xmppConnectionServiceBound) {
+                processFingerprintVerification(uri, false);
+            } else {
+                this.pendingUri = uri;
+            }
+        }
+    }
+
+    @Override
+    public void onSaveInstanceState(@NonNull final Bundle savedInstanceState) {
+        if (mAccount != null) {
+            savedInstanceState.putString("account", mAccount.getJid().asBareJid().toString());
+            savedInstanceState.putBoolean("initMode", mInitMode);
+            savedInstanceState.putBoolean(
+                    "showMoreTable", binding.serverInfoMore.getVisibility() == View.VISIBLE);
+        }
+        super.onSaveInstanceState(savedInstanceState);
+    }
+
+    protected void onBackendConnected() {
+        boolean init = true;
+        if (mSavedInstanceAccount != null) {
+            try {
+                this.mAccount =
+                        xmppConnectionService.findAccountByJid(Jid.of(mSavedInstanceAccount));
+                this.mInitMode = mSavedInstanceInit;
+                init = false;
+            } catch (IllegalArgumentException e) {
+                this.mAccount = null;
+            }
+
+        } else if (this.jidToEdit != null) {
+            this.mAccount = xmppConnectionService.findAccountByJid(jidToEdit);
+            if (this.mAccount == null && Boolean.FALSE.equals(this.mForceRegister)) {
+                // handoff from MonoclesSignupActivity: prefill the freshly
+                // provisioned address so the user only enters their app password
+                this.binding.accountJid.getEditableText().clear();
+                this.binding.accountJid.getEditableText().append(this.jidToEdit.asBareJid().toString());
+            }
+        }
+
+        if (mAccount != null) {
+            this.mInitMode |= this.mAccount.isOptionSet(Account.OPTION_REGISTER);
+            this.mUsernameMode |=
+                    mAccount.isOptionSet(Account.OPTION_MAGIC_CREATE)
+                            && mAccount.isOptionSet(Account.OPTION_REGISTER);
+            if (mPendingFingerprintVerificationUri != null) {
+                processFingerprintVerification(mPendingFingerprintVerificationUri, false);
+                mPendingFingerprintVerificationUri = null;
+            }
+            updateAccountInformation(init);
+        }
+
+        if (Config.MAGIC_CREATE_DOMAIN == null
+                && this.xmppConnectionService.getAccounts().size() == 0) {
+            this.binding.cancelButton.setEnabled(false);
+        }
+        if (mUsernameMode) {
+            this.binding.accountJidLayout.setHint(getString(R.string.username_hint));
+        } else {
+            final KnownHostsAdapter mKnownHostsAdapter =
+                    new KnownHostsAdapter(
+                            this,
+                            R.layout.item_autocomplete,
+                            xmppConnectionService.getKnownHosts());
+            this.binding.accountJid.setAdapter(mKnownHostsAdapter);
+        }
+
+        if (pendingUri != null) {
+            processFingerprintVerification(pendingUri, false);
+            pendingUri = null;
+        }
+        loadVCardData();
+        updatePortLayout();
+        updateSaveButton();
+        invalidateOptionsMenu();
+    }
+
+    private String getUserModeDomain() {
+        if (mAccount != null && mAccount.getJid().getDomain() != null) {
+            return mAccount.getServer();
+        } else {
+            return null;
+        }
+    }
+
+    @Override
+    public boolean onOptionsItemSelected(final MenuItem item) {
+        if (MenuDoubleTabUtil.shouldIgnoreTap()) {
+            return false;
+        }
+        final int id = item.getItemId();
+        if (id == android.R.id.home) {
+            deleteAccountAndReturnIfNecessary();
+        } else if (id == R.id.action_show_block_list) {
+            final Intent showBlocklistIntent = new Intent(this, BlocklistActivity.class);
+            showBlocklistIntent.putExtra(EXTRA_ACCOUNT, mAccount.getJid().toString());
+            startActivity(showBlocklistIntent);
+        } else if (id == R.id.action_server_info_show_more) {
+            changeMoreTableVisibility(!item.isChecked());
+        } else if (id == R.id.action_share_barcode) {
+            shareBarcode();
+        } else if (id == R.id.action_share_http) {
+            shareLink(true);
+        } else if (id == R.id.action_share_uri) {
+            shareLink(false);
+        } else if (id == R.id.action_change_password_on_server) {
+            gotoChangePassword();
+        } else if (id == R.id.action_delete_account) {
+            deleteAccount();
+        } else if (id == R.id.action_mam_prefs) {
+            editMamPrefs();
+        } else if (id == R.id.action_renew_certificate) {
+            renewCertificate();
+        } else if (id == R.id.action_change_presence) {
+            changePresence();
+        } else if (id == R.id.action_import_backup) {
+            if (hasStoragePermission(REQUEST_IMPORT_BACKUP)) {
+                startActivity(new Intent(this, ImportBackupActivity.class));
+            }
+        }
+        return super.onOptionsItemSelected(item);
+    }
+
+    private void deleteAccount() {
+        this.deleteAccount(mAccount, () -> finish());
+    }
+
+    private boolean inNeedOfSaslAccept() {
+        return mAccount != null
+                && mAccount.getLastErrorStatus() == Account.State.DOWNGRADE_ATTACK
+                && mAccount.getPinnedMechanismPriority() >= 0
+                && !accountInfoEdited();
+    }
+
+    private void shareBarcode() {
+        Intent intent = new Intent(Intent.ACTION_SEND);
+        intent.putExtra(Intent.EXTRA_STREAM, BarcodeProvider.getUriForAccount(this, mAccount));
+        intent.setFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        intent.setType("image/png");
+        startActivity(Intent.createChooser(intent, getText(R.string.share_with)));
+    }
+
+    private void changeMoreTableVisibility(final boolean visible) {
+        binding.serverInfoMore.setVisibility(visible ? View.VISIBLE : View.GONE);
+        binding.serverInfoLoginMechanism.setVisibility(visible ? View.VISIBLE : View.GONE);
+    }
+
+    private void gotoChangePassword() {
+        KeyguardManager keyguardManager = (KeyguardManager) this.getSystemService(Context.KEYGUARD_SERVICE);
+        Intent credentialsIntent = keyguardManager.createConfirmDeviceCredentialIntent("Unlock required", "Please unlock in order to change your password");
+        if (credentialsIntent == null) {
+            openChangePassword(false);
+        } else {
+            startActivityForResult(credentialsIntent, REQUEST_UNLOCK);
+        }
+    }
+
+    private void openChangePassword(boolean didUnlock) {
+        final Intent changePasswordIntent = new Intent(this, ChangePasswordActivity.class);
+        changePasswordIntent.putExtra(EXTRA_ACCOUNT, mAccount.getJid().toString());
+        changePasswordIntent.putExtra("did_unlock", didUnlock);
+        startActivity(changePasswordIntent);
+    }
+
+    private void renewCertificate() {
+        KeyChain.choosePrivateKeyAlias(this, this, null, null, null, -1, null);
+    }
+
+    private void changePresence() {
+        SharedPreferences sharedPreferences = PreferenceManager.getDefaultSharedPreferences(this);
+        boolean manualStatus =
+                sharedPreferences.getBoolean(
+                        AppSettings.MANUALLY_CHANGE_PRESENCE,
+                        getResources().getBoolean(R.bool.manually_change_presence));
+        final MaterialAlertDialogBuilder builder = new MaterialAlertDialogBuilder(this);
+        final DialogPresenceBinding binding =
+                DataBindingUtil.inflate(getLayoutInflater(), R.layout.dialog_presence, null, false);
+        String current = mAccount.getPresenceStatusMessage();
+        if (current != null && !current.trim().isEmpty()) {
+            binding.statusMessage.append(current);
+        }
+        setAvailabilityRadioButton(mAccount.getPresenceStatus(), binding);
+        binding.show.setVisibility(manualStatus ? View.VISIBLE : View.GONE);
+        List<PresenceTemplate> templates = xmppConnectionService.getPresenceTemplates(mAccount);
+        PresenceTemplateAdapter presenceTemplateAdapter =
+                new PresenceTemplateAdapter(this, R.layout.item_autocomplete, templates);
+        binding.statusMessage.setAdapter(presenceTemplateAdapter);
+        binding.statusMessage.setOnItemClickListener(
+                (parent, view, position, id) -> {
+                    PresenceTemplate template =
+                            (PresenceTemplate) parent.getItemAtPosition(position);
+                    setAvailabilityRadioButton(template.getStatus(), binding);
+                });
+        builder.setTitle(R.string.edit_status_message_title);
+        builder.setView(binding.getRoot());
+        builder.setNegativeButton(R.string.cancel, null);
+        builder.setPositiveButton(
+                R.string.confirm,
+                (dialog, which) -> {
+                    PresenceTemplate template =
+                            new PresenceTemplate(
+                                    getAvailabilityRadioButton(binding),
+                                    binding.statusMessage.getText().toString().trim());
+                    if (mAccount.getPgpId() != 0 && hasPgp()) {
+                        generateSignature(null, template);
+                    } else {
+                        xmppConnectionService.changeStatus(mAccount, template, null);
+                    }
+                });
+        builder.create().show();
+    }
+
+    private void generateSignature(Intent intent, PresenceTemplate template) {
+        xmppConnectionService
+                .getPgpEngine()
+                .generateSignature(
+                        intent,
+                        mAccount,
+                        template.getStatusMessage(),
+                        new UiCallback<String>() {
+                            @Override
+                            public void success(String signature) {
+                                xmppConnectionService.changeStatus(mAccount, template, signature);
+                            }
+
+                            @Override
+                            public void error(int errorCode, String object) {}
+
+                            @Override
+                            public void userInputRequired(PendingIntent pi, String object) {
+                                mPendingPresenceTemplate.push(template);
+                                try {
+                                    startIntentSenderForResult(
+                                            pi.getIntentSender(),
+                                            REQUEST_CHANGE_STATUS,
+                                            null,
+                                            0,
+                                            0,
+                                            0,
+                                            Compatibility.pgpStartIntentSenderOptions());
+                                } catch (final IntentSender.SendIntentException ignored) {
+                                }
+                            }
+                        });
+    }
+
+    @Override
+    public void alias(String alias) {
+        if (alias != null) {
+            xmppConnectionService.updateKeyInAccount(mAccount, alias);
+        }
+    }
+
+    void showColorDialog() {
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        final ColorPickerView picker = new ColorPickerView(this);
+
+        if (mAccount != null) picker.setColor(mAccount.getColor(isDark()));
+        picker.showAlpha(true);
+        picker.showHex(true);
+        picker.showPreview(true);
+        builder
+                .setTitle(null)
+                .setView(picker)
+                .setPositiveButton(R.string.ok, (dialog, which) -> {
+                    final int color = picker.getColor();
+                    binding.colorPreview.setBackgroundColor(color);
+                    updateSaveButton();
+                })
+                .setNegativeButton(R.string.cancel, (dialog, which) -> {});
+        builder.show();
+    }
+
+    private void updateAccountInformation(boolean init) {
+        if (init) {
+            this.binding.accountJid.getEditableText().clear();
+            if (mUsernameMode) {
+                this.binding.accountJid.getEditableText().append(this.mAccount.getJid().getLocal());
+            } else {
+                this.binding
+                        .accountJid
+                        .getEditableText()
+                        .append(this.mAccount.getJid().asBareJid().toString());
+            }
+            this.binding.accountPassword.getEditableText().clear();
+            this.binding.accountPassword.getEditableText().append(this.mAccount.getPassword());
+            this.binding.hostname.setText("");
+            this.binding.hostname.getEditableText().append(this.mAccount.getHostname());
+            this.binding.port.setText("");
+            this.binding.port.getEditableText().append(String.valueOf(this.mAccount.getPort()));
+            this.binding.namePort.setVisibility(mShowOptions ? View.VISIBLE : View.GONE);
+        }
+
+        final var preferences = getPreferences();
+        binding.quietHoursEnable.setChecked(preferences.getBoolean("enable_quiet_hours:" + mAccount.getUuid(), false));
+
+        if (binding.quietHoursEnable.isChecked()) {
+            binding.quietHoursStartBox.setVisibility(View.VISIBLE);
+            binding.quietHoursEndBox.setVisibility(View.VISIBLE);
+        } else {
+            binding.quietHoursStartBox.setVisibility(View.GONE);
+            binding.quietHoursEndBox.setVisibility(View.GONE);
+        }
+
+        final var startTime = preferences.getLong("quiet_hours_start:" + mAccount.getUuid(), 1320);
+        final DateFormat dateFormat = android.text.format.DateFormat.getTimeFormat(this);
+        final Date date = TimePreference.minutesToCalender(startTime).getTime();
+        binding.quietHoursStart.setText(dateFormat.format(date.getTime()));
+
+        final var endTime = preferences.getLong("quiet_hours_end:" + mAccount.getUuid(), 480);
+        final DateFormat dateFormatE = android.text.format.DateFormat.getTimeFormat(this);
+        final Date dateE = TimePreference.minutesToCalender(endTime).getTime();
+        binding.quietHoursEnd.setText(dateFormat.format(dateE.getTime()));
+
+        if (!mInitMode && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            this.binding.accountPassword.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
+        }
+
+        final boolean editable =
+                !mAccount.isOptionSet(Account.OPTION_LOGGED_IN_SUCCESSFULLY)
+                        && !mAccount.isOptionSet(Account.OPTION_FIXED_USERNAME);
+        this.binding.accountJid.setEnabled(editable);
+        this.binding.accountJid.setFocusable(editable);
+        this.binding.accountJid.setFocusableInTouchMode(editable);
+        this.binding.accountJid.setCursorVisible(editable);
+
+        final String displayName = mAccount.getDisplayName();
+        updateDisplayName(displayName);
+
+        if (xmppConnectionService != null && xmppConnectionService.getAccounts().size() > 1) {
+            binding.accountColorBox.setVisibility(View.VISIBLE);
+            binding.colorPreview.setBackgroundColor(mAccount.getColor(isDark()));
+            binding.quietHoursBox.setVisibility(View.VISIBLE);
+        } else {
+            binding.accountColorBox.setVisibility(View.GONE);
+            binding.quietHoursBox.setVisibility(View.GONE);
+        }
+
+        final boolean togglePassword =
+                mAccount.isOptionSet(Account.OPTION_MAGIC_CREATE)
+                        || !mAccount.isOptionSet(Account.OPTION_LOGGED_IN_SUCCESSFULLY);
+        final boolean neverLoggedIn =
+                !mAccount.isOptionSet(Account.OPTION_LOGGED_IN_SUCCESSFULLY);
+        final boolean editPassword = mAccount.unauthorized() || neverLoggedIn;
+
+        this.binding.accountPasswordLayout.setPasswordVisibilityToggleEnabled(togglePassword);
+
+        this.binding.accountPassword.setFocusable(editPassword);
+        this.binding.accountPassword.setFocusableInTouchMode(editPassword);
+        this.binding.accountPassword.setCursorVisible(editPassword);
+        this.binding.accountPassword.setEnabled(editPassword);
+
+        if (!mInitMode) {
+            this.binding.avater.setVisibility(View.VISIBLE);
+            AvatarWorkerTask.loadAvatar(
+                    mAccount, binding.avater, R.dimen.avatar_on_details_screen_size);
+        } else {
+            this.binding.avater.setVisibility(View.GONE);
+        }
+        this.binding.accountRegisterNew.setChecked(
+                this.mAccount.isOptionSet(Account.OPTION_REGISTER));
+        if (this.mAccount.isOptionSet(Account.OPTION_MAGIC_CREATE)) {
+            if (this.mAccount.isOptionSet(Account.OPTION_REGISTER)) {
+                ActionBar actionBar = getSupportActionBar();
+                if (actionBar != null) {
+                    actionBar.setTitle(R.string.create_account);
+                }
+            }
+            this.binding.accountRegisterNew.setVisibility(View.GONE);
+        } else if (this.mAccount.isOptionSet(Account.OPTION_REGISTER) && mForceRegister == null) {
+            this.binding.accountRegisterNew.setVisibility(View.VISIBLE);
+        } else {
+            this.binding.accountRegisterNew.setVisibility(View.GONE);
+        }
+        if (this.mAccount.isOnlineAndConnected() && !this.mFetchingAvatar) {
+            final Features features = this.mAccount.getXmppConnection().getFeatures();
+            this.binding.stats.setVisibility(View.VISIBLE);
+            this.binding.vcard.setVisibility(View.VISIBLE);
+            boolean showBatteryWarning = isOptimizingBattery();
+            boolean showDataSaverWarning = isAffectedByDataSaver();
+            showOsOptimizationWarning(showBatteryWarning, showDataSaverWarning);
+            this.binding.sessionEst.setText(
+                    UIHelper.readableTimeDifferenceFull(
+                            this, this.mAccount.getXmppConnection().getLastSessionEstablished(), allowRelativeTimestamps()));
+            if (features.rosterVersioning()) {
+                this.binding.serverInfoRosterVersion.setText(R.string.server_info_available);
+            } else {
+                this.binding.serverInfoRosterVersion.setText(R.string.server_info_unavailable);
+            }
+            if (features.carbons()) {
+                this.binding.serverInfoCarbons.setText(R.string.server_info_available);
+            } else {
+                this.binding.serverInfoCarbons.setText(R.string.server_info_unavailable);
+            }
+            if (features.mam()) {
+                this.binding.serverInfoMam.setText(R.string.server_info_available);
+            } else {
+                this.binding.serverInfoMam.setText(R.string.server_info_unavailable);
+            }
+            if (features.csi()) {
+                this.binding.serverInfoCsi.setText(R.string.server_info_available);
+            } else {
+                this.binding.serverInfoCsi.setText(R.string.server_info_unavailable);
+            }
+            if (features.blocking()) {
+                this.binding.serverInfoBlocking.setText(R.string.server_info_available);
+            } else {
+                this.binding.serverInfoBlocking.setText(R.string.server_info_unavailable);
+            }
+            if (features.sm()) {
+                this.binding.serverInfoSm.setText(R.string.server_info_available);
+            } else {
+                this.binding.serverInfoSm.setText(R.string.server_info_unavailable);
+            }
+            if (features.externalServiceDiscovery()) {
+                this.binding.serverInfoExternalService.setText(R.string.server_info_available);
+            } else {
+                this.binding.serverInfoExternalService.setText(R.string.server_info_unavailable);
+            }
+            if (features.bind2()) {
+                this.binding.serverInfoBind2.setText(R.string.server_info_available);
+            } else {
+                this.binding.serverInfoBind2.setText(R.string.server_info_unavailable);
+            }
+            if (features.sasl2()) {
+                this.binding.serverInfoSasl2.setText(R.string.server_info_available);
+            } else {
+                this.binding.serverInfoSasl2.setText(R.string.server_info_unavailable);
+            }
+            this.binding.loginMechanism.setText(Strings.nullToEmpty(features.loginMechanism()));
+            if (features.pep()) {
+                AxolotlService axolotlService = this.mAccount.getAxolotlService();
+                if (axolotlService != null && axolotlService.isPepBroken()) {
+                    this.binding.serverInfoPep.setText(R.string.server_info_broken);
+                } else if (features.pepPublishOptions() || features.pepOmemoWhitelisted()) {
+                    this.binding.serverInfoPep.setText(R.string.server_info_available);
+                } else {
+                    this.binding.serverInfoPep.setText(R.string.server_info_partial);
+                }
+            } else {
+                this.binding.serverInfoPep.setText(R.string.server_info_unavailable);
+            }
+            if (features.httpUpload(0)) {
+                final long maxFileSize = features.getMaxHttpUploadSize();
+                if (maxFileSize > 0) {
+                    this.binding.serverInfoHttpUpload.setText(
+                            UIHelper.filesizeToString(maxFileSize));
+                } else {
+                    this.binding.serverInfoHttpUpload.setText(R.string.server_info_available);
+                }
+            } else {
+                this.binding.serverInfoHttpUpload.setText(R.string.server_info_unavailable);
+            }
+
+            this.binding.pushRow.setVisibility(
+                    xmppConnectionService.getPushManagementService().isStub()
+                            ? View.GONE
+                            : View.VISIBLE);
+
+            if (xmppConnectionService.getPushManagementService().available(mAccount)) {
+                this.binding.serverInfoPush.setText(R.string.server_info_available);
+            } else {
+                this.binding.serverInfoPush.setText(R.string.server_info_unavailable);
+            }
+            final long pgpKeyId = this.mAccount.getPgpId();
+            if (pgpKeyId != 0 && Config.supportOpenPgp()) {
+                OnClickListener openPgp = view -> launchOpenKeyChain(pgpKeyId);
+                OnClickListener delete = view -> showDeletePgpDialog();
+                this.binding.pgpFingerprintBox.setVisibility(View.VISIBLE);
+                this.binding.pgpFingerprint.setText(OpenPgpUtils.convertKeyIdToHex(pgpKeyId));
+                this.binding.pgpFingerprint.setOnClickListener(openPgp);
+                if ("pgp".equals(messageFingerprint)) {
+                    this.binding.pgpFingerprintDesc.setTextColor(
+                            MaterialColors.getColor(
+                                    binding.pgpFingerprintDesc,
+                                    com.google.android.material.R.attr.colorPrimaryVariant));
+                }
+                this.binding.pgpFingerprintDesc.setOnClickListener(openPgp);
+                this.binding.actionDeletePgp.setOnClickListener(delete);
+            } else {
+                this.binding.pgpFingerprintBox.setVisibility(View.GONE);
+            }
+            final String ownAxolotlFingerprint =
+                    this.mAccount.getAxolotlService().getOwnFingerprint();
+            if (ownAxolotlFingerprint != null && Config.supportOmemo()) {
+                // Show (and copy) the HYBRID fingerprint, committing to both the
+                // classical and the post-quantum (ML-DSA-87) identity key, so manual
+                // verification authenticates the post-quantum key too. Trust, the QR
+                // code and message-highlight matching stay keyed on the classical
+                // fingerprint (ownAxolotlFingerprint).
+                String ownDisplayedFingerprint;
+                try {
+                    ownDisplayedFingerprint =
+                            this.mAccount.getAxolotlService().getOwnHybridFingerprint();
+                } catch (final RuntimeException e) {
+                    ownDisplayedFingerprint = ownAxolotlFingerprint.substring(2);
+                }
+                final String ownFingerprintToCopy = ownDisplayedFingerprint;
+                this.binding.axolotlFingerprintBox.setVisibility(View.VISIBLE);
+                this.binding.axolotlFingerprintBox.setOnCreateContextMenuListener(
+                        (menu, v, menuInfo) -> {
+                            getMenuInflater().inflate(R.menu.omemo_key_context, menu);
+                            menu.findItem(R.id.verify_scan).setVisible(false);
+                            menu.findItem(R.id.distrust_key).setVisible(false);
+                            this.mSelectedFingerprint = ownAxolotlFingerprint;
+                            this.mSelectedFingerprintDisplay = ownFingerprintToCopy;
+                        });
+                if (ownAxolotlFingerprint.equals(messageFingerprint)) {
+                    this.binding.ownFingerprintDesc.setTextColor(
+                            MaterialColors.getColor(
+                                    binding.ownFingerprintDesc,
+                                    com.google.android.material.R.attr.colorPrimaryVariant));
+                    this.binding.ownFingerprintDesc.setText(
+                            R.string.omemo2_fingerprint_selected_message);
+                } else {
+                    this.binding.ownFingerprintDesc.setTextColor(
+                            MaterialColors.getColor(
+                                    binding.ownFingerprintDesc,
+                                    com.google.android.material.R.attr.colorOnSurface));
+                    this.binding.ownFingerprintDesc.setText(R.string.omemo2_fingerprint);
+                }
+                this.binding.axolotlFingerprint.setText(
+                        CryptoHelper.prettifyFingerprint(ownDisplayedFingerprint));
+                this.binding.axolotlFingerprint.setOnLongClickListener(v -> {
+                    copyOmemoFingerprint(ownFingerprintToCopy);
+                    return true;
+                });
+                this.binding.showQrCodeButton.setVisibility(View.VISIBLE);
+                this.binding.showQrCodeButton.setOnClickListener(v -> showQrCode());
+            } else {
+                this.binding.axolotlFingerprintBox.setVisibility(View.GONE);
+            }
+            // Own LEGACY (XEP-0384 v0.3) fingerprint, shown alongside the PQ
+            // OMEMO2 one only while legacy OMEMO is enabled. The legacy stack
+            // keeps a separate identity key, so this is a distinct fingerprint;
+            // never merge the two (strict OMEMO2/legacy separation).
+            final String ownLegacyFingerprint =
+                    this.mAccount.getAxolotlService().getOwnLegacyFingerprint();
+            if (ownLegacyFingerprint != null && Config.supportOmemo()) {
+                final String legacyDisplayedFingerprint =
+                        ownLegacyFingerprint.length() > 2
+                                ? ownLegacyFingerprint.substring(2)
+                                : ownLegacyFingerprint;
+                this.binding.legacyFingerprintBox.setVisibility(View.VISIBLE);
+                this.binding.legacyFingerprintBox.setOnCreateContextMenuListener(
+                        (menu, v, menuInfo) -> {
+                            getMenuInflater().inflate(R.menu.omemo_key_context, menu);
+                            menu.findItem(R.id.verify_scan).setVisible(false);
+                            menu.findItem(R.id.distrust_key).setVisible(false);
+                            this.mSelectedFingerprint = ownLegacyFingerprint;
+                            this.mSelectedFingerprintDisplay = legacyDisplayedFingerprint;
+                        });
+                if (ownLegacyFingerprint.equals(messageFingerprint)) {
+                    this.binding.legacyFingerprintDesc.setTextColor(
+                            MaterialColors.getColor(
+                                    binding.legacyFingerprintDesc,
+                                    com.google.android.material.R.attr.colorPrimaryVariant));
+                    this.binding.legacyFingerprintDesc.setText(
+                            R.string.omemo_legacy_fingerprint_selected_message);
+                } else {
+                    this.binding.legacyFingerprintDesc.setTextColor(
+                            MaterialColors.getColor(
+                                    binding.legacyFingerprintDesc,
+                                    com.google.android.material.R.attr.colorOnSurface));
+                    this.binding.legacyFingerprintDesc.setText(R.string.omemo_legacy_fingerprint);
+                }
+                this.binding.legacyFingerprint.setText(
+                        CryptoHelper.prettifyFingerprint(legacyDisplayedFingerprint));
+                this.binding.legacyFingerprint.setOnLongClickListener(v -> {
+                    copyOmemoFingerprint(legacyDisplayedFingerprint);
+                    return true;
+                });
+                // Same code as the OMEMO2 one: a single QR carries both stacks'
+                // keys (see Account#getFingerprints), the legacy one under the
+                // parameter every OMEMO client understands. The button is
+                // repeated here so the legacy key does not look unverifiable.
+                this.binding.legacyShowQrCodeButton.setOnClickListener(v -> showQrCode());
+            } else {
+                this.binding.legacyFingerprintBox.setVisibility(View.GONE);
+            }
+            boolean hasKeys = false;
+            boolean showUnverifiedWarning = false;
+            binding.otherDeviceKeys.removeAllViews();
+            final Collection<XmppAxolotlSession> sessions = mAccount.getAxolotlService().findOwnSessions();
+            final List<AxolotlService.LegacySessionInfo> legacySessions = mAccount.getAxolotlService().findOwnLegacySessions();
+            final LayoutInflater inflater = getLayoutInflater();
+
+            if (!sessions.isEmpty() && !legacySessions.isEmpty()) {
+                View header = inflater.inflate(R.layout.simple_list_item, binding.otherDeviceKeys, false);
+                TextView tv = header.findViewById(android.R.id.text1);
+                tv.setText(R.string.encryption_choice_omemo2);
+                tv.setBackground(null);
+                tv.setPadding(tv.getPaddingLeft(), 0, tv.getPaddingRight(), 0);
+                binding.otherDeviceKeys.addView(header);
+            }
+
+            for (final XmppAxolotlSession session : sessions) {
+                final FingerprintStatus trust = session.getTrust();
+                if (!trust.isCompromised()) {
+                    boolean highlight = session.getFingerprint().equals(messageFingerprint);
+                    addFingerprintRow(binding.otherDeviceKeys, session, highlight);
+                    hasKeys = true;
+                }
+                if (trust.isUnverified()) {
+                    showUnverifiedWarning = true;
+                }
+            }
+
+            if (!legacySessions.isEmpty()) {
+                if (!sessions.isEmpty()) {
+                    View header = inflater.inflate(R.layout.simple_list_item, binding.otherDeviceKeys, false);
+                    TextView tv = header.findViewById(android.R.id.text1);
+                    tv.setText(R.string.encryption_choice_omemo_legacy);
+                    tv.setBackground(null);
+                    tv.setPadding(tv.getPaddingLeft(), 16, tv.getPaddingRight(), 0);
+                    binding.otherDeviceKeys.addView(header);
+                }
+                for (final AxolotlService.LegacySessionInfo legacySession : legacySessions) {
+                    if (!legacySession.status.isCompromised()) {
+                        boolean highlight = legacySession.fingerprint.equals(messageFingerprint);
+                        addFingerprintRow(binding.otherDeviceKeys, mAccount, legacySession.fingerprint, legacySession.status, highlight, true);
+                        hasKeys = true;
+                    }
+                    if (legacySession.status.isUnverified()) {
+                        showUnverifiedWarning = true;
+                    }
+                }
+            }
+            if (hasKeys
+                    && Config.supportOmemo()) { // TODO: either the button should be visible if we
+                // print an active device or the device list should
+                // be fed with reactivated devices
+                this.binding.otherDeviceKeysCard.setVisibility(View.VISIBLE);
+                Set<Integer> otherDevices = mAccount.getAxolotlService().getOwnDeviceIds();
+                if (otherDevices == null || otherDevices.isEmpty()) {
+                    binding.clearDevices.setVisibility(View.GONE);
+                } else {
+                    binding.clearDevices.setVisibility(View.VISIBLE);
+                }
+                binding.unverifiedWarning.setVisibility(
+                        showUnverifiedWarning ? View.VISIBLE : View.GONE);
+                binding.scanButton.setVisibility(showUnverifiedWarning ? View.VISIBLE : View.GONE);
+            } else {
+                this.binding.otherDeviceKeysCard.setVisibility(View.GONE);
+            }
+            this.binding.verificationBox.setVisibility(View.VISIBLE);
+            if (mAccount.getXmppConnection() != null && mAccount.getXmppConnection().resolverAuthenticated()) {
+                if (mAccount.getXmppConnection().daneVerified()) {
+                    this.binding.verificationMessage.setText(R.string.dnssec_dane_verified);
+                    this.binding.verificationIndicator.setImageResource(R.drawable.shield_verified);
+                } else {
+                    this.binding.verificationMessage.setText(R.string.dnssec_verified);
+                    this.binding.verificationIndicator.setImageResource(R.drawable.shield);
+                }
+            } else {
+                this.binding.verificationMessage.setText(R.string.not_dnssec_verified);
+                this.binding.verificationIndicator.setImageResource(R.drawable.shield_question);
+            }
+        } else {
+            final TextInputLayout errorLayout;
+            final var status = this.mAccount.getStatus();
+            if (status.isError()
+                    || Arrays.asList(
+                            Account.State.NO_INTERNET,
+                            Account.State.MISSING_INTERNET_PERMISSION)
+                    .contains(status)) {
+                if (status == Account.State.UNAUTHORIZED
+                        || status == Account.State.DOWNGRADE_ATTACK) {
+                    errorLayout = this.binding.accountPasswordLayout;
+                } else if (mShowOptions
+                        && status == Account.State.SERVER_NOT_FOUND
+                        && this.binding.hostname.getText().length() > 0) {
+                    errorLayout = this.binding.hostnameLayout;
+                } else {
+                    errorLayout = this.binding.accountJidLayout;
+                }
+                errorLayout.setError(getString(this.mAccount.getStatus().getReadableId()));
+                if (init || !accountInfoEdited()) {
+                    errorLayout.requestFocus();
+                }
+            } else {
+                errorLayout = null;
+            }
+            removeErrorsOnAllBut(errorLayout);
+            this.binding.stats.setVisibility(View.GONE);
+            this.binding.vcard.setVisibility(View.GONE);
+            this.binding.otherDeviceKeysCard.setVisibility(View.GONE);
+            this.binding.verificationBox.setVisibility(View.GONE);
+        }
+    }
+
+    private void updateDisplayName(String displayName) {
+        if (TextUtils.isEmpty(displayName)) {
+            this.binding.yourName.setText(R.string.no_name_set_instructions);
+            this.binding.yourName.setTextColor(
+                    MaterialColors.getColor(
+                            binding.yourName,
+                            com.google.android.material.R.attr.colorOnSurfaceVariant));
+        } else {
+            this.binding.yourName.setText(displayName);
+            this.binding.yourName.setTextColor(
+                    MaterialColors.getColor(
+                            binding.yourName,
+                            com.google.android.material.R.attr.colorOnSurfaceVariant));
+        }
+    }
+
+    private void removeErrorsOnAllBut(TextInputLayout exception) {
+        if (this.binding.accountJidLayout != exception) {
+            this.binding.accountJidLayout.setErrorEnabled(false);
+            this.binding.accountJidLayout.setError(null);
+        }
+        if (this.binding.accountPasswordLayout != exception) {
+            this.binding.accountPasswordLayout.setErrorEnabled(false);
+            this.binding.accountPasswordLayout.setError(null);
+        }
+        if (this.binding.hostnameLayout != exception) {
+            this.binding.hostnameLayout.setErrorEnabled(false);
+            this.binding.hostnameLayout.setError(null);
+        }
+        if (this.binding.portLayout != exception) {
+            this.binding.portLayout.setErrorEnabled(false);
+            this.binding.portLayout.setError(null);
+        }
+    }
+
+    private void showDeletePgpDialog() {
+        final MaterialAlertDialogBuilder builder = new MaterialAlertDialogBuilder(this);
+        builder.setTitle(R.string.unpublish_pgp);
+        builder.setMessage(R.string.unpublish_pgp_message);
+        builder.setNegativeButton(R.string.cancel, null);
+        builder.setPositiveButton(
+                R.string.confirm,
+                (dialogInterface, i) -> {
+                    mAccount.setPgpSignId(0);
+                    mAccount.unsetPgpSignature();
+                    xmppConnectionService.databaseBackend.updateAccount(mAccount);
+                    xmppConnectionService.sendPresence(mAccount);
+                    refreshUiReal();
+                });
+        builder.create().show();
+    }
+
+    private void showOsOptimizationWarning(
+            boolean showBatteryWarning, boolean showDataSaverWarning) {
+        this.binding.osOptimization.setVisibility(
+                showBatteryWarning || showDataSaverWarning ? View.VISIBLE : View.GONE);
+        if (showDataSaverWarning
+                && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+            this.binding.osOptimizationHeadline.setText(R.string.data_saver_enabled);
+            this.binding.osOptimizationBody.setText(
+                    getString(R.string.data_saver_enabled_explained, getString(R.string.app_name)));
+            this.binding.osOptimizationDisable.setText(R.string.allow);
+            this.binding.osOptimizationDisable.setOnClickListener(
+                    v -> {
+                        Intent intent =
+                                new Intent(
+                                        Settings
+                                                .ACTION_IGNORE_BACKGROUND_DATA_RESTRICTIONS_SETTINGS);
+                        Uri uri = Uri.parse("package:" + getPackageName());
+                        intent.setData(uri);
+                        try {
+                            startActivityForResult(intent, REQUEST_DATA_SAVER);
+                        } catch (ActivityNotFoundException e) {
+                            Toast.makeText(
+                                            EditAccountActivity.this,
+                                            getString(
+                                                    R.string.device_does_not_support_data_saver,
+                                                    getString(R.string.app_name)),
+                                            Toast.LENGTH_SHORT)
+                                    .show();
+                        }
+                    });
+        } else if (showBatteryWarning) {
+            this.binding.osOptimizationDisable.setText(R.string.disable);
+            this.binding.osOptimizationHeadline.setText(R.string.battery_optimizations_enabled);
+            this.binding.osOptimizationBody.setText(
+                    getString(
+                            R.string.battery_optimizations_enabled_explained,
+                            getString(R.string.app_name)));
+            this.binding.osOptimizationDisable.setOnClickListener(
+                    v -> {
+                        Intent intent =
+                                new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                        Uri uri = Uri.parse("package:" + getPackageName());
+                        intent.setData(uri);
+                        try {
+                            startActivityForResult(intent, REQUEST_BATTERY_OP);
+                        } catch (ActivityNotFoundException e) {
+                            Toast.makeText(
+                                            EditAccountActivity.this,
+                                            R.string.device_does_not_support_battery_op,
+                                            Toast.LENGTH_SHORT)
+                                    .show();
+                        }
+                    });
+        }
+    }
+
+    public void showWipePepDialog() {
+        final MaterialAlertDialogBuilder builder = new MaterialAlertDialogBuilder(this);
+        builder.setTitle(getString(R.string.clear_other_devices));
+        builder.setIconAttribute(android.R.attr.alertDialogIcon);
+        builder.setMessage(getString(R.string.clear_other_devices_desc));
+        builder.setNegativeButton(getString(R.string.cancel), null);
+        builder.setPositiveButton(
+                getString(R.string.accept),
+                (dialog, which) -> mAccount.getAxolotlService().wipeOtherPepDevices());
+        builder.create().show();
+    }
+
+    private void editMamPrefs() {
+        this.mFetchingMamPrefsToast =
+                Toast.makeText(this, R.string.fetching_mam_prefs, Toast.LENGTH_LONG);
+        this.mFetchingMamPrefsToast.show();
+        xmppConnectionService.fetchMamPreferences(mAccount, this);
+    }
+
+    @Override
+    public void onKeyStatusUpdated(AxolotlService.FetchStatus report) {
+        refreshUi();
+    }
+
+    @Override
+    public void onCaptchaRequested(
+            final Account account, final String id, final Data data, final Bitmap captcha) {
+        runOnUiThread(
+                () -> {
+                    if (mCaptchaDialog != null && mCaptchaDialog.isShowing()) {
+                        mCaptchaDialog.dismiss();
+                    }
+                    if (!getLifecycle().getCurrentState().isAtLeast(Lifecycle.State.RESUMED)) {
+                        Log.d(Config.LOGTAG, "activity not running when captcha was requested");
+                        return;
+                    }
+                    final MaterialAlertDialogBuilder builder =
+                            new MaterialAlertDialogBuilder(EditAccountActivity.this);
+                    final View view = getLayoutInflater().inflate(R.layout.captcha, null);
+                    final ImageView imageView = view.findViewById(R.id.captcha);
+                    final EditText input = view.findViewById(R.id.input);
+                    imageView.setImageBitmap(captcha);
+
+                    builder.setTitle(getString(R.string.captcha_required));
+                    builder.setView(view);
+
+                    builder.setPositiveButton(
+                            getString(R.string.ok),
+                            (dialog, which) -> {
+                                String rc = input.getText().toString();
+                                data.put("username", account.getUsername());
+                                data.put("password", account.getPassword());
+                                data.put("ocr", rc);
+                                data.submit();
+
+                                if (xmppConnectionServiceBound) {
+                                    xmppConnectionService.sendCreateAccountWithCaptchaPacket(
+                                            account, id, data);
+                                }
+                            });
+                    builder.setNegativeButton(
+                            getString(R.string.cancel),
+                            (dialog, which) -> {
+                                if (xmppConnectionService != null) {
+                                    xmppConnectionService.sendCreateAccountWithCaptchaPacket(
+                                            account, null, null);
+                                }
+                            });
+
+                    builder.setOnCancelListener(
+                            dialog -> {
+                                if (xmppConnectionService != null) {
+                                    xmppConnectionService.sendCreateAccountWithCaptchaPacket(
+                                            account, null, null);
+                                }
+                            });
+                    mCaptchaDialog = builder.create();
+                    mCaptchaDialog.show();
+                    input.requestFocus();
+                });
+    }
+
+    public void onShowErrorToast(final int resId) {
+        runOnUiThread(
+                () -> Toast.makeText(EditAccountActivity.this, resId, Toast.LENGTH_SHORT).show());
+    }
+
+    @Override
+    public void onPreferencesFetched(final Element prefs) {
+        runOnUiThread(
+                () -> {
+                    if (mFetchingMamPrefsToast != null) {
+                        mFetchingMamPrefsToast.cancel();
+                    }
+                    final MaterialAlertDialogBuilder builder =
+                            new MaterialAlertDialogBuilder(EditAccountActivity.this);
+                    builder.setTitle(R.string.server_side_mam_prefs);
+                    String defaultAttr = prefs.getAttribute("default");
+                    final List<String> defaults = Arrays.asList("never", "roster", "always");
+                    final AtomicInteger choice =
+                            new AtomicInteger(Math.max(0, defaults.indexOf(defaultAttr)));
+                    builder.setSingleChoiceItems(
+                            R.array.mam_prefs, choice.get(), (dialog, which) -> choice.set(which));
+                    builder.setNegativeButton(R.string.cancel, null);
+                    builder.setPositiveButton(
+                            R.string.ok,
+                            (dialog, which) -> {
+                                prefs.setAttribute("default", defaults.get(choice.get()));
+                                xmppConnectionService.pushMamPreferences(mAccount, prefs);
+                            });
+                    if (getLifecycle().getCurrentState().isAtLeast(Lifecycle.State.RESUMED)) {
+                        builder.create().show();
+                    }
+                });
+    }
+
+    @Override
+    public void onPreferencesFetchFailed() {
+        runOnUiThread(
+                () -> {
+                    if (mFetchingMamPrefsToast != null) {
+                        mFetchingMamPrefsToast.cancel();
+                    }
+                    Toast.makeText(
+                                    EditAccountActivity.this,
+                                    R.string.unable_to_fetch_mam_prefs,
+                                    Toast.LENGTH_LONG)
+                            .show();
+                });
+    }
+
+    @Override
+    public void OnUpdateBlocklist(Status status) {
+        refreshUi();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
+        if (grantResults.length > 0) {
+            if (allGranted(grantResults)) {
+                switch (requestCode) {
+                    case REQUEST_IMPORT_BACKUP:
+                        startActivity(new Intent(this, ImportBackupActivity.class));
+                        break;
+                }
+            } else {
+                Toast.makeText(this, R.string.no_storage_permission, Toast.LENGTH_SHORT).show();
+            }
+        }
+        if (writeGranted(grantResults, permissions)) {
+            if (xmppConnectionService != null) {
+                xmppConnectionService.restartFileObserver();
+            }
+        }
+    }
+
+    private boolean allowRelativeTimestamps() {
+        final SharedPreferences p = PreferenceManager.getDefaultSharedPreferences(this);
+        return !p.getBoolean("always_full_timestamps", getResources().getBoolean(R.bool.always_full_timestamps));
+    }
+
+    private void loadVCardData() {
+        if (mAccount == null) return;
+        xmppConnectionService.fetchVcard4(mAccount, mAccount.getSelfContact(), (vcard4) -> {
+            if (vcard4 == null) return;
+
+            runOnUiThread(() -> {
+                mIsLoadingVCard = true;
+                binding.profileDetailsContainer.removeAllViews();
+
+                for (Element el : vcard4.getChildren()) {
+                    String type = el.getName();
+                    String value = null;
+                    if (el.findChildEnsureSingle("uri", Namespace.VCARD4) != null) {
+                        value = el.findChildContent("uri", Namespace.VCARD4);
+                    } else if (el.findChildEnsureSingle("text", Namespace.VCARD4) != null) {
+                        value = el.findChildContent("text", Namespace.VCARD4);
+                    }
+
+                    if (value != null) {
+                        addVCardRow(type, value);
+                    }
+                }
+                mIsLoadingVCard = false;
+            });
+        });
+    }
+
+
+    private void addVCardRow(String type, String value) {
+        View rowView = getLayoutInflater().inflate(R.layout.item_edit_vcard_entry, binding.profileDetailsContainer, false);
+
+        Spinner spinner = rowView.findViewById(R.id.vcard_type_spinner);
+        EditText input = rowView.findViewById(R.id.vcard_value_input);
+        View removeBtn = rowView.findViewById(R.id.btn_remove_entry);
+        View dragBtn = rowView.findViewById(R.id.btn_drag_entry);
+
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, VCARD_TYPES);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spinner.setAdapter(adapter);
+
+        for (int i = 0; i < VCARD_TYPES.length; i++) {
+            if (VCARD_TYPES[i].equalsIgnoreCase(type)) {
+                spinner.setSelection(i);
+                break;
+            }
+        }
+
+        if (value != null) {
+            input.setText(value);
+        }
+
+        // 1. Monitor Text Changes
+        input.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            @Override
+            public void onTextChanged(CharSequence s, int start, int before, int count) {}
+            @Override
+            public void afterTextChanged(Editable s) {
+                if (!mIsLoadingVCard) {
+                    mVCardModified = true;
+                    refreshUi(); // This triggers the check to enable the Save button
+                }
+            }
+        });
+
+        // 2. Monitor Type Selection Changes
+        spinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                if (!mIsLoadingVCard) {
+                    mVCardModified = true;
+                    refreshUi();
+                }
+            }
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {}
+        });
+
+        // 3. Monitor Remove Button
+        removeBtn.setOnClickListener(v -> {
+            binding.profileDetailsContainer.removeView(rowView);
+            mVCardModified = true;
+            refreshUi();
+        });
+
+        // 4. Enable Drag and Drop via the specific handle
+        // Using OnTouchListener allows immediate drag start without a long press delay
+        dragBtn.setOnTouchListener((v, event) -> {
+            if (event.getAction() == MotionEvent.ACTION_DOWN) {
+                View.DragShadowBuilder shadowBuilder = new View.DragShadowBuilder(rowView);
+
+                // Fix for crash: Pass valid ClipData instead of null.
+                // Use a custom MIME type so EditTexts ignore this drag and don't try to insert text.
+                android.content.ClipData data = new android.content.ClipData(
+                        "vcard_reorder",
+                        new String[]{"application/x-private-reorder"},
+                        new android.content.ClipData.Item("")
+                );
+
+                // Start drag on the whole row
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    v.startDragAndDrop(data, shadowBuilder, rowView, 0);
+                }
+                return true;
+            }
+            return false;
+        });
+
+
+        // Ensure the container listens for drags
+        binding.profileDetailsContainer.setOnDragListener(mProfileDragListener);
+
+        binding.profileDetailsContainer.addView(rowView);
+    }
+
+    private void saveVCardData() {
+        if (mAccount == null) return;
+
+        // XEP-0292: The inner element is <vcard xmlns='urn:ietf:params:xml:ns:vcard-4.0'>
+        Element vcardElement = new Element("vcard");
+        vcardElement.setAttribute("xmlns", Namespace.VCARD4); // Ensure you use the constant or "urn:ietf:params:xml:ns:vcard-4.0"
+
+        int childCount = binding.profileDetailsContainer.getChildCount();
+
+        for (int i = 0; i < childCount; i++) {
+            View rowView = binding.profileDetailsContainer.getChildAt(i);
+            Spinner spinner = rowView.findViewById(R.id.vcard_type_spinner);
+            EditText input = rowView.findViewById(R.id.vcard_value_input);
+
+            String type = spinner.getSelectedItem().toString();
+            String value = input.getText().toString().trim();
+
+            if (value.isEmpty()) continue;
+
+            Element item = new Element(type);
+
+            // Strict XEP-0292 mapping
+            if (type.equals("url") || type.equals("impp") || type.equals("geo") || type.equals("photo") || type.equals("logo") || type.equals("sound")) {
+                Element uri = new Element("uri");
+                uri.setContent(value);
+                item.addChild(uri);
+            } else if (type.equals("tel")) {
+                Element uri = new Element("uri");
+                if (!value.startsWith("tel:")) value = "tel:" + value;
+                uri.setContent(value);
+                item.addChild(uri);
+            } else if (type.equals("xmpp")) {
+                Element uri = new Element("uri");
+                if (!value.startsWith("xmpp:")) value = "xmpp:" + value;
+                uri.setContent(value);
+                item.addChild(uri);
+            } else if (type.equals("mailto")) {
+                Element uri = new Element("mailto");
+                if (!value.startsWith("mailto:")) value = "mailto:" + value;
+                uri.setContent(value);
+                item.addChild(uri);
+            } else if (type.equals("taler")) {
+                Element uri = new Element("taler");
+                if (!value.startsWith("taler:")) value = "taler:" + value;
+                uri.setContent(value);
+                item.addChild(uri);
+            } else if (type.equals("fn")) {
+                // Specific handling for Formatted Name (FN)
+                Element text = new Element("text");
+                text.setContent(value);
+                item.addChild(text);
+            } else {
+                // other, nickname, note, org, title, role, etc use <text>
+                Element text = new Element("text");
+                text.setContent(value);
+                item.addChild(text);
+            }
+
+            vcardElement.addChild(item);
+        }
+
+        mVCardModified = false;
+        refreshUi();
+
+        xmppConnectionService.publishVCard4(mAccount, vcardElement);
+    }
+
+    private final View.OnDragListener mProfileDragListener = (v, event) -> {
+        switch (event.getAction()) {
+            case DragEvent.ACTION_DRAG_STARTED:
+                return true;
+            case DragEvent.ACTION_DRAG_LOCATION:
+                final View draggedView = (View) event.getLocalState();
+                final ViewGroup container = (ViewGroup) v;
+                final float y = event.getY();
+                View targetView = null;
+
+                // Find the child view under the current drag position
+                for (int i = 0; i < container.getChildCount(); i++) {
+                    final View child = container.getChildAt(i);
+                    if (y > child.getTop() && y < child.getBottom()) {
+                        targetView = child;
+                        break;
+                    }
+                }
+
+                // If we found a target and it's not the one we are dragging, swap them
+                if (targetView != null && targetView != draggedView) {
+                    final int targetIndex = container.indexOfChild(targetView);
+                    container.removeView(draggedView);
+                    container.addView(draggedView, targetIndex);
+                }
+                return true;
+            case DragEvent.ACTION_DROP:
+                mVCardModified = true;
+                refreshUi();
+                return true;
+            default:
+                return false;
+        }
+    };
+
+    private String generateVCardString() {
+        int childCount = binding.profileDetailsContainer.getChildCount();
+        if (childCount == 0 && mAccount.getDisplayName() == null) return null;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("BEGIN:VCARD\n");
+        sb.append("VERSION:4.0\n");
+
+        // Add FN (Formatted Name) if available from account or calculate it
+        // Depending on your logic, you might want to pull this from a specific 'nickname' row or the account object
+        // if (mAccount.getDisplayName() != null && !mAccount.getDisplayName().isEmpty()) {
+        //     sb.append("FN:").append(mAccount.getDisplayName()).append("\n");
+        // }
+
+        for (int i = 0; i < childCount; i++) {
+            View rowView = binding.profileDetailsContainer.getChildAt(i);
+            Spinner spinner = rowView.findViewById(R.id.vcard_type_spinner);
+            EditText input = rowView.findViewById(R.id.vcard_value_input);
+
+            String type = spinner.getSelectedItem().toString();
+            String value = input.getText().toString().trim();
+
+            if (value.isEmpty()) continue;
+
+            // Simple mapping from internal types to VCard properties
+            switch (type) {
+                case "fn":
+                    sb.append("FN:").append(value).append("\n");
+                    break;
+                case "tel":
+                    sb.append("TEL;VALUE=uri:").append(value.startsWith("tel:") ? value : "tel:" + value).append("\n");
+                    break;
+                case "mailto":
+                    sb.append("EMAIL:").append(value.startsWith("mailto:") ? value.substring(7) : value).append("\n");
+                    break;
+                case "xmpp":
+                    sb.append("IMPP:").append(value.startsWith("xmpp:") ? value : "xmpp:" + value).append("\n");
+                    break;
+                case "url":
+                    sb.append("URL:").append(value).append("\n");
+                    break;
+                case "nickname":
+                    sb.append("NICKNAME:").append(value).append("\n");
+                    break;
+                case "note":
+                    sb.append("NOTE:").append(value).append("\n");
+                    break;
+                case "org":
+                    sb.append("ORG:").append(value).append("\n");
+                    break;
+                case "title":
+                    sb.append("TITLE:").append(value).append("\n");
+                    break;
+                case "role":
+                    sb.append("ROLE:").append(value).append("\n");
+                    break;
+                case "bday":
+                    sb.append("BDAY:").append(value).append("\n");
+                    break;
+                // Add other cases as needed based on VCARD_TYPES
+                default:
+                    // Fallback for generic text
+                    sb.append("X-").append(type.toUpperCase()).append(":").append(value).append("\n");
+                    break;
+            }
+        }
+
+        sb.append("END:VCARD");
+        return sb.toString();
+    }
+
+    private void showQrCodeDialog(String content) {
+        try {
+            // Calculate dimensions
+            int width = (int) (getResources().getDisplayMetrics().widthPixels * 0.8);
+
+            // Generate QR Bitmap
+            com.google.zxing.MultiFormatWriter writer = new com.google.zxing.MultiFormatWriter();
+            com.google.zxing.common.BitMatrix result = writer.encode(content, com.google.zxing.BarcodeFormat.QR_CODE, width, width);
+
+            // Convert BitMatrix to Bitmap
+            int w = result.getWidth();
+            int h = result.getHeight();
+            int[] pixels = new int[w * h];
+            for (int y = 0; y < h; y++) {
+                int offset = y * w;
+                for (int x = 0; x < w; x++) {
+                    pixels[offset + x] = result.get(x, y) ? android.graphics.Color.BLACK : android.graphics.Color.WHITE;
+                }
+            }
+            android.graphics.Bitmap bitmap = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888);
+            bitmap.setPixels(pixels, 0, w, 0, 0, w, h);
+
+            // Show in Dialog
+            ImageView imageView = new ImageView(this);
+            imageView.setImageBitmap(bitmap);
+            imageView.setPadding(32, 32, 32, 32);
+
+            new MaterialAlertDialogBuilder(this)
+                    .setTitle("VCard QR Code")
+                    .setView(imageView)
+                    .setPositiveButton(R.string.ok, null)
+                    .show();
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            Toast.makeText(this, "Failed to generate QR Code", Toast.LENGTH_SHORT).show();
+        }
+    }
+}

@@ -1,0 +1,89 @@
+name: Build APK (cloud)
+
+# Builds the fork entirely in the cloud (GitHub Actions runner).
+# Result: downloadable APKs in the run's "Artifacts" section — no local
+# Android SDK / NDK / Rust needed on your machine.
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+  workflow_dispatch:        # lets you trigger a build manually from the Actions tab
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_JOBS: 2   # keep the Rust compile from hogging all cores
+    steps:
+      - name: Checkout fork (incl. libsignal submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive   # deps/libsignal -> codeberg.org/monocles/pq-omemo-2
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK command line tools
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages (platform, build-tools, NDK)
+        run: |
+          sdkmanager "platforms;android-36" \
+                     "build-tools;36.0.0" \
+                     "platform-tools" \
+                     "ndk;28.2.13676358"
+          yes | sdkmanager --licenses >/dev/null
+
+      - name: Install Rust nightly pinned by libsignal submodule
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-23
+          targets: >-
+            aarch64-linux-android,
+            armv7-linux-androideabi,
+            x86_64-linux-android,
+            i686-linux-android
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Configure release signing (only if keystore secrets are set)
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > keystore.jks
+            {
+              echo "keystore=keystore.jks"
+              echo "keystore.password=$KEYSTORE_PASSWORD"
+              echo "keystore.alias=$KEYSTORE_ALIAS"
+            } > signing.properties
+            echo "release signing configured"
+          else
+            echo "no keystore secrets set -> debug APKs only"
+          fi
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEYSTORE_ALIAS: ${{ secrets.KEYSTORE_ALIAS }}
+
+      - name: List available assemble tasks (for troubleshooting)
+        run: ./gradlew tasks --all 2>/dev/null | grep -iE 'assemble[A-Za-z]*Free(Compat|System)?(Debug|Release)' | head -20
+
+      - name: Build debug APK
+        run: ./gradlew --max-workers=2 -Dorg.gradle.jvmargs=-Xmx3g assembleMonocleschatFreeDebug
+
+      - name: Build signed release APK
+        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        run: ./gradlew --max-workers=2 -Dorg.gradle.jvmargs=-Xmx3g assembleMonocleschatFreeRelease
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: monocleschat-apks
+          path: |
+            build/outputs/apk/monocleschatFree/debug/*.apk
+            build/outputs/apk/monocleschatFree/release/*.apk
+          if-no-files-found: warn

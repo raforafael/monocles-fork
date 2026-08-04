@@ -1,0 +1,1111 @@
+package eu.siacs.conversations.generator;
+
+import android.media.MediaMetadata;
+import android.os.Bundle;
+import android.util.Base64;
+import android.util.Base64OutputStream;
+import android.util.Log;
+
+import de.monocles.chat.BobTransfer;
+
+import com.google.common.base.Strings;
+import com.google.common.io.ByteStreams;
+
+import org.signal.libsignal.protocol.IdentityKey;
+import org.signal.libsignal.protocol.ecc.ECPublicKey;
+import org.signal.libsignal.protocol.state.KyberPreKeyRecord;
+import org.signal.libsignal.protocol.state.PreKeyRecord;
+import org.signal.libsignal.protocol.state.SignedPreKeyRecord;
+
+import java.io.ByteArrayOutputStream;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.security.cert.CertificateEncodingException;
+import java.security.cert.X509Certificate;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+import java.util.TimeZone;
+import java.util.UUID;
+
+import io.ipfs.cid.Cid;
+
+import eu.siacs.conversations.Config;
+import eu.siacs.conversations.R;
+import eu.siacs.conversations.crypto.axolotl.AxolotlService;
+import eu.siacs.conversations.entities.Account;
+import eu.siacs.conversations.entities.Bookmark;
+import eu.siacs.conversations.entities.Conversation;
+import eu.siacs.conversations.entities.DownloadableFile;
+import eu.siacs.conversations.entities.Message;
+import eu.siacs.conversations.services.MessageArchiveService;
+import eu.siacs.conversations.services.QuickConversationsService;
+import eu.siacs.conversations.services.XmppConnectionService;
+import eu.siacs.conversations.xml.Element;
+import eu.siacs.conversations.xml.Namespace;
+import eu.siacs.conversations.xmpp.Jid;
+import eu.siacs.conversations.xmpp.forms.Data;
+import eu.siacs.conversations.xmpp.pep.Avatar;
+import im.conversations.android.xmpp.model.stanza.Iq;
+
+public class IqGenerator extends AbstractGenerator {
+
+    public IqGenerator(final XmppConnectionService service) {
+        super(service);
+    }
+
+    public Iq discoResponse(final Account account, final Iq request) {
+        final var packet = new Iq(Iq.Type.RESULT);
+        packet.setId(request.getId());
+        packet.setTo(request.getFrom());
+        final Element query = packet.addChild("query", "http://jabber.org/protocol/disco#info");
+        query.setAttribute("node", request.query().getAttribute("node"));
+        final Element identity = query.addChild("identity");
+        identity.setAttribute("category", "client");
+        identity.setAttribute("type", getIdentityType());
+        identity.setAttribute("name", getIdentityName());
+        for (final String feature : getFeatures(account)) {
+            query.addChild("feature").setAttribute("var", feature);
+        }
+        return packet;
+    }
+
+    public Iq versionResponse(final Iq request) {
+        final var packet = request.generateResponse(Iq.Type.RESULT);
+        Element query = packet.query("jabber:iq:version");
+        query.addChild("name").setContent(mXmppConnectionService.getString(R.string.app_name));
+        query.addChild("version").setContent(getIdentityVersion());
+        return packet;
+    }
+
+    public Iq entityTimeResponse(final Iq request) {
+        final Iq packet = request.generateResponse(Iq.Type.RESULT);
+        Element time = packet.addChild("time", "urn:xmpp:time");
+        final long now = System.currentTimeMillis();
+        time.addChild("utc").setContent(getTimestamp(now));
+        TimeZone ourTimezone = TimeZone.getDefault();
+        long offsetSeconds = ourTimezone.getOffset(now) / 1000;
+        long offsetMinutes = Math.abs((offsetSeconds % 3600) / 60);
+        long offsetHours = offsetSeconds / 3600;
+        String hours;
+        if (offsetHours < 0) {
+            hours = String.format(Locale.US, "%03d", offsetHours);
+        } else {
+            hours = String.format(Locale.US, "%02d", offsetHours);
+        }
+        String minutes = String.format(Locale.US, "%02d", offsetMinutes);
+        time.addChild("tzo").setContent(hours + ":" + minutes);
+        return packet;
+    }
+
+    public static Iq purgeOfflineMessages() {
+        final Iq packet = new Iq(Iq.Type.SET);
+        packet.addChild("offline", Namespace.FLEXIBLE_OFFLINE_MESSAGE_RETRIEVAL).addChild("purge");
+        return packet;
+    }
+
+    protected Iq publish(final String node, final Element item, final Bundle options) {
+        final var packet = new Iq(Iq.Type.SET);
+        final Element pubsub = packet.addChild("pubsub", Namespace.PUBSUB);
+        final Element publish = pubsub.addChild("publish");
+        publish.setAttribute("node", node);
+        publish.addChild(item);
+        if (options != null) {
+            final Element publishOptions = pubsub.addChild("publish-options");
+            publishOptions.addChild(Data.create(Namespace.PUBSUB_PUBLISH_OPTIONS, options));
+        }
+        return packet;
+    }
+
+    protected Iq publish(final String node, final Element item) {
+        return publish(node, item, null);
+    }
+
+    private Iq retrieve(String node, Element item) {
+        final var packet = new Iq(Iq.Type.GET);
+        final Element pubsub = packet.addChild("pubsub", Namespace.PUBSUB);
+        final Element items = pubsub.addChild("items");
+        items.setAttribute("node", node);
+        if (item != null) {
+            items.addChild(item);
+        }
+        return packet;
+    }
+
+    public Iq retrieveVcard4(final Jid jid) {
+        final var packet = retrieve("urn:xmpp:vcard4", null);
+        packet.setTo(jid);
+        return packet;
+    }
+
+    public Iq retrieveBookmarks() {
+        return retrieve(Namespace.BOOKMARKS2, null);
+    }
+
+    public Iq retrieveMds() {
+        return retrieve(Namespace.MDS_DISPLAYED, null);
+    }
+
+    public Iq publishNick(String nick) {
+        final Element item = new Element("item");
+        item.setAttribute("id", "current");
+        item.addChild("nick", Namespace.NICK).setContent(nick);
+        return publish(Namespace.NICK, item);
+    }
+
+    public Iq deleteNode(final String node) {
+        final var packet = new Iq(Iq.Type.SET);
+        final Element pubsub = packet.addChild("pubsub", Namespace.PUBSUB_OWNER);
+        pubsub.addChild("delete").setAttribute("node", node);
+        return packet;
+    }
+
+    public Iq deleteItem(final String node, final String id) {
+        final var packet = new Iq(Iq.Type.SET);
+        final Element pubsub = packet.addChild("pubsub", Namespace.PUBSUB);
+        final Element retract = pubsub.addChild("retract");
+        retract.setAttribute("node", node);
+        retract.setAttribute("notify", "true");
+        retract.addChild("item").setAttribute("id", id);
+        return packet;
+    }
+
+    public Iq publishAvatar(Avatar avatar, Bundle options) {
+        final Element item = new Element("item");
+        item.setAttribute("id", avatar.sha1sum);
+        final Element data = item.addChild("data", Namespace.AVATAR_DATA);
+        data.setContent(avatar.image);
+        return publish(Namespace.AVATAR_DATA, item, options);
+    }
+
+    public Iq publishUserTune() {
+        final Element item = new Element("item");
+        item.setAttribute("id", "monoclesUserTune");
+        item.addChild("tune", Namespace.USER_TUNE);
+        return publish(Namespace.USER_TUNE, item, null);
+    }
+
+    public Iq publishUserTune(MediaMetadata metadata, final Bundle options) {
+        final Element item = new Element("item");
+        item.setAttribute("id", "monoclesUserTune");
+
+        final Element tuneElement = item.addChild("tune", Namespace.USER_TUNE);
+
+        CharSequence artist = metadata.getText(MediaMetadata.METADATA_KEY_ARTIST);
+        if (artist != null) {
+            tuneElement.addChild("artist").setContent(artist.toString());
+        }
+
+        CharSequence title = metadata.getText(MediaMetadata.METADATA_KEY_TITLE);
+        if (title != null) {
+            tuneElement.addChild("title").setContent(title.toString());
+        }
+
+        CharSequence album = metadata.getText(MediaMetadata.METADATA_KEY_ALBUM);
+        if (album != null) {
+            tuneElement.addChild("source").setContent(album.toString());
+        }
+
+        Long trackNumber = metadata.getLong(MediaMetadata.METADATA_KEY_TRACK_NUMBER);
+        if (trackNumber != null && trackNumber > 0) {
+            tuneElement.addChild("track").setContent(trackNumber.toString());
+        }
+
+        Long durationMs = metadata.getLong(MediaMetadata.METADATA_KEY_DURATION);
+        if (durationMs != null && durationMs > 0) {
+            tuneElement.addChild("length").setContent(String.valueOf(durationMs / 1000));
+        }
+
+        return publish(Namespace.USER_TUNE, item, options);
+    }
+
+    public Iq publishElement(
+            final String namespace, final Element element, String id, final Bundle options) {
+        final Element item = new Element("item");
+        item.setAttribute("id", id);
+        item.addChild(element);
+        return publish(namespace, item, options);
+    }
+
+    public Iq publishStory(final Account account, final String url, final String type, final String title, Bundle options) {
+        final Element item = new Element("item");
+        final String storyId = UUID.randomUUID().toString();
+        item.setAttribute("id", storyId);
+        final Element entry = item.addChild("entry", Namespace.ATOM);
+
+        entry.addChild("id").setContent("urn:uuid:" + storyId);
+
+        String effectiveTitle = title;
+        if (Strings.isNullOrEmpty(effectiveTitle)) {
+            SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US);
+            effectiveTitle = "Story " + sdf.format(new Date());
+        }
+        entry.addChild("title").setContent(effectiveTitle);
+
+        final String timestamp = getTimestamp(System.currentTimeMillis());
+        entry.addChild("updated").setContent(timestamp);
+        entry.addChild("published").setContent(timestamp);
+
+        if (account != null) {
+            entry.addChild("author").addChild("uri").setContent("xmpp:" + account.getJid().asBareJid());
+        }
+
+        final Element link = entry.addChild("link");
+        link.setAttribute("rel", "enclosure");
+        link.setAttribute("href", url);
+        link.setAttribute("type", type);
+        link.setAttribute("title", effectiveTitle);
+
+        return publish(Namespace.PUBSUB_STORIES, item, options);
+    }
+
+    public Iq retrieveStories(Jid jid) {
+        final Iq iq = new Iq(Iq.Type.GET);
+        iq.setTo(jid);
+        final Element pubsub = iq.addChild("pubsub", Namespace.PUBSUB);
+        final Element items = pubsub.addChild("items");
+        items.setAttribute("node", Namespace.PUBSUB_STORIES);
+        return iq;
+    }
+
+    public Iq publishAvatarMetadata(final Avatar avatar, final Bundle options) {
+        final Element item = new Element("item");
+        item.setAttribute("id", avatar.sha1sum);
+        final Element metadata = item.addChild("metadata", Namespace.AVATAR_METADATA);
+        final Element info = metadata.addChild("info");
+        info.setAttribute("bytes", avatar.size);
+        info.setAttribute("id", avatar.sha1sum);
+        info.setAttribute("height", avatar.height);
+        info.setAttribute("width", avatar.height);
+        info.setAttribute("type", avatar.type);
+        return publish(Namespace.AVATAR_METADATA, item, options);
+    }
+
+    public Iq retrievePepAvatar(final Avatar avatar) {
+        final Element item = new Element("item");
+        item.setAttribute("id", avatar.sha1sum);
+        final var packet = retrieve(Namespace.AVATAR_DATA, item);
+        packet.setTo(avatar.owner);
+        return packet;
+    }
+
+    public Iq retrieveVcardAvatar(final Avatar avatar) {
+        final Iq packet = new Iq(Iq.Type.GET);
+        packet.setTo(avatar.owner);
+        packet.addChild("vCard", "vcard-temp");
+        return packet;
+    }
+
+    public Iq retrieveVcardAvatar(final Jid to) {
+        final Iq packet = new Iq(Iq.Type.GET);
+        packet.setTo(to);
+        packet.addChild("vCard", "vcard-temp");
+        return packet;
+    }
+
+    public Iq retrieveAvatarMetaData(final Jid to) {
+        final Iq packet = retrieve("urn:xmpp:avatar:metadata", null);
+        if (to != null) {
+            packet.setTo(to);
+        }
+        return packet;
+    }
+
+    public Iq retrieveDeviceIds(final Jid to) {
+        final var packet = retrieve(AxolotlService.PEP_DEVICE_LIST, null);
+        if (to != null) {
+            packet.setTo(to);
+        }
+        return packet;
+    }
+
+    public Iq retrieveBundlesForDevice(final Jid to, final int deviceid) {
+        final var packet = retrieve(AxolotlService.PEP_BUNDLES + ":" + deviceid, null);
+        packet.setTo(to);
+        return packet;
+    }
+
+    public Iq retrieveVerificationForDevice(final Jid to, final int deviceid) {
+        final var packet = retrieve(AxolotlService.PEP_VERIFICATION + ":" + deviceid, null);
+        packet.setTo(to);
+        return packet;
+    }
+
+    public Iq publishDeviceIds(final Set<Integer> ids, final Bundle publishOptions) {
+        final Element item = new Element("item");
+        item.setAttribute("id", "current");
+        final Element list = item.addChild("list", AxolotlService.PEP_PREFIX);
+        for (Integer id : ids) {
+            final Element device = new Element("device");
+            device.setAttribute("id", id);
+            list.addChild(device);
+        }
+        return publish(AxolotlService.PEP_DEVICE_LIST, item, publishOptions);
+    }
+
+    public Element publishBookmarkItem(final Bookmark bookmark) {
+        final String name = bookmark.getBookmarkName();
+        final String nick = bookmark.getNick();
+        final String password = bookmark.getPassword();
+        final boolean autojoin = bookmark.autojoin();
+        final Element conference = new Element("conference", Namespace.BOOKMARKS2);
+        if (!Strings.isNullOrEmpty(name)) {
+            conference.setAttribute("name", name);
+        }
+        if (!Strings.isNullOrEmpty(nick)) {
+            conference.addChild("nick").setContent(nick);
+        }
+        if (password != null) {
+            conference.addChild("password").setContent(password);
+        }
+        conference.setAttribute("autojoin", String.valueOf(autojoin));
+        conference.addChild(bookmark.getExtensions());
+        return conference;
+    }
+
+    public Element mdsDisplayed(final String stanzaId, final Conversation conversation) {
+        final Jid by;
+        if (conversation.getMode() == Conversation.MODE_MULTI) {
+            by = conversation.getJid().asBareJid();
+        } else {
+            by = conversation.getAccount().getJid().asBareJid();
+        }
+        return mdsDisplayed(stanzaId, by);
+    }
+
+    private Element mdsDisplayed(final String stanzaId, final Jid by) {
+        final Element displayed = new Element("displayed", Namespace.MDS_DISPLAYED);
+        final Element stanzaIdElement = displayed.addChild("stanza-id", Namespace.STANZA_IDS);
+        stanzaIdElement.setAttribute("id", stanzaId);
+        stanzaIdElement.setAttribute("by", by);
+        return displayed;
+    }
+
+    public Iq publishBundles(
+            final SignedPreKeyRecord signedPreKeyRecord,
+            final IdentityKey identityKey,
+            final Set<PreKeyRecord> preKeyRecords,
+            final int deviceId,
+            Bundle publishOptions) {
+        try {
+            final Element item = new Element("item");
+            item.setAttribute("id", "current");
+            final Element bundle = item.addChild("bundle", AxolotlService.PEP_PREFIX);
+            final Element signedPreKeyPublic = bundle.addChild("signedPreKeyPublic");
+            signedPreKeyPublic.setAttribute("signedPreKeyId", signedPreKeyRecord.getId());
+            ECPublicKey publicKey = signedPreKeyRecord.getKeyPair().getPublicKey();
+            signedPreKeyPublic.setContent(Base64.encodeToString(publicKey.serialize(), Base64.NO_WRAP));
+            final Element signedPreKeySignature = bundle.addChild("signedPreKeySignature");
+            signedPreKeySignature.setContent(
+                    Base64.encodeToString(signedPreKeyRecord.getSignature(), Base64.NO_WRAP));
+            final Element identityKeyElement = bundle.addChild("identityKey");
+            identityKeyElement.setContent(
+                    Base64.encodeToString(identityKey.serialize(), Base64.NO_WRAP));
+
+            final Element prekeys = bundle.addChild("prekeys", AxolotlService.PEP_PREFIX);
+            for (PreKeyRecord preKeyRecord : preKeyRecords) {
+                final Element prekey = prekeys.addChild("preKeyPublic");
+                prekey.setAttribute("preKeyId", preKeyRecord.getId());
+                prekey.setContent(
+                        Base64.encodeToString(
+                                preKeyRecord.getKeyPair().getPublicKey().serialize(), Base64.NO_WRAP));
+            }
+
+            return publish(AxolotlService.PEP_BUNDLES + ":" + deviceId, item, publishOptions);
+        } catch (org.signal.libsignal.protocol.InvalidKeyException e) {
+            throw new AssertionError("locally generated key is invalid", e);
+        }
+    }
+
+    /**
+     * Publish a legacy XEP-0384 v0.3 bundle (no KEM material) using
+     * old-libsignal types. Same wire format as {@link #publishBundles}; only the
+     * Java types of the prekeys differ. Used only when the user enables global
+     * legacy OMEMO support so peers without OMEMO2/PQXDH can build a session
+     * with us.
+     */
+    public Iq publishLegacyBundles(
+            final org.whispersystems.libsignal.state.SignedPreKeyRecord signedPreKeyRecord,
+            final org.whispersystems.libsignal.IdentityKey identityKey,
+            final Set<org.whispersystems.libsignal.state.PreKeyRecord> preKeyRecords,
+            final int deviceId,
+            final Bundle publishOptions) {
+        final Element item = new Element("item");
+        item.setAttribute("id", "current");
+        final Element bundle = item.addChild("bundle", AxolotlService.PEP_PREFIX);
+        final Element signedPreKeyPublic = bundle.addChild("signedPreKeyPublic");
+        signedPreKeyPublic.setAttribute("signedPreKeyId", signedPreKeyRecord.getId());
+        final org.whispersystems.libsignal.ecc.ECPublicKey publicKey =
+                signedPreKeyRecord.getKeyPair().getPublicKey();
+        signedPreKeyPublic.setContent(Base64.encodeToString(publicKey.serialize(), Base64.NO_WRAP));
+        final Element signedPreKeySignature = bundle.addChild("signedPreKeySignature");
+        signedPreKeySignature.setContent(
+                Base64.encodeToString(signedPreKeyRecord.getSignature(), Base64.NO_WRAP));
+        final Element identityKeyElement = bundle.addChild("identityKey");
+        identityKeyElement.setContent(
+                Base64.encodeToString(identityKey.serialize(), Base64.NO_WRAP));
+        final Element prekeys = bundle.addChild("prekeys", AxolotlService.PEP_PREFIX);
+        for (final org.whispersystems.libsignal.state.PreKeyRecord r : preKeyRecords) {
+            final Element prekey = prekeys.addChild("preKeyPublic");
+            prekey.setAttribute("preKeyId", r.getId());
+            prekey.setContent(
+                    Base64.encodeToString(r.getKeyPair().getPublicKey().serialize(), Base64.NO_WRAP));
+        }
+        return publish(AxolotlService.PEP_BUNDLES + ":" + deviceId, item, publishOptions);
+    }
+
+    /** Publish PQ-OMEMO2 bundle to Namespace.OMEMO2_BUNDLES (item id = deviceId). */
+    public Iq publishOmemo2Bundles(
+            final SignedPreKeyRecord signedPreKeyRecord,
+            final IdentityKey identityKey,
+            final Set<PreKeyRecord> preKeyRecords,
+            final KyberPreKeyRecord kyberSignedPreKeyRecord,
+            final List<KyberPreKeyRecord> kyberPreKeyRecords,
+            final byte[] pqIdentityKey,
+            final byte[] pqSignature,
+            final int deviceId,
+            final Bundle publishOptions) {
+        try {
+            final Element item = new Element("item");
+            item.setAttribute("id", String.valueOf(deviceId));
+            final Element bundle = item.addChild("bundle", Namespace.OMEMO2);
+            final Element spk = bundle.addChild("spk");
+            spk.setAttribute("id", signedPreKeyRecord.getId());
+            // OMEMO2 spec: EC public keys are raw 32-byte Curve25519 keys (no 0x05 type prefix)
+            spk.setContent(Base64.encodeToString(
+                    signedPreKeyRecord.getKeyPair().getPublicKey().getPublicKeyBytes(), Base64.NO_WRAP));
+            bundle.addChild("spks").setContent(
+                    Base64.encodeToString(signedPreKeyRecord.getSignature(), Base64.NO_WRAP));
+            bundle.addChild("ik").setContent(
+                    Base64.encodeToString(identityKey.getPublicKey().getPublicKeyBytes(), Base64.NO_WRAP));
+            final Element prekeys = bundle.addChild("prekeys");
+            for (final PreKeyRecord preKeyRecord : preKeyRecords) {
+                final Element pk = prekeys.addChild("pk");
+                pk.setAttribute("id", preKeyRecord.getId());
+                pk.setContent(Base64.encodeToString(
+                        preKeyRecord.getKeyPair().getPublicKey().getPublicKeyBytes(), Base64.NO_WRAP));
+            }
+            // PQXDH: signed KEM prekey
+            if (kyberSignedPreKeyRecord != null) {
+                final Element kemSpk = bundle.addChild("kem-spk");
+                kemSpk.setAttribute("id", kyberSignedPreKeyRecord.getId());
+                kemSpk.setContent(Base64.encodeToString(
+                        kyberSignedPreKeyRecord.getKeyPair().getPublicKey().serialize(), Base64.NO_WRAP));
+                bundle.addChild("kem-spks").setContent(
+                        Base64.encodeToString(kyberSignedPreKeyRecord.getSignature(), Base64.NO_WRAP));
+            }
+            // PQXDH: one-time KEM prekeys
+            if (kyberPreKeyRecords != null && !kyberPreKeyRecords.isEmpty()) {
+                final Element kemPrekeys = bundle.addChild("kem-prekeys");
+                for (final KyberPreKeyRecord kemRecord : kyberPreKeyRecords) {
+                    final Element kemPk = kemPrekeys.addChild("kem-pk");
+                    kemPk.setAttribute("id", kemRecord.getId());
+                    kemPk.setAttribute("sig", Base64.encodeToString(kemRecord.getSignature(), Base64.NO_WRAP));
+                    kemPk.setContent(Base64.encodeToString(
+                            kemRecord.getKeyPair().getPublicKey().serialize(), Base64.NO_WRAP));
+                }
+            }
+            // monocles PQ-OMEMO2 hybrid identity: post-quantum (ML-DSA-87) identity
+            // key and its signature over the bundle transcript. Mandatory for this
+            // build — peers refuse a bundle that lacks them (never downgrade).
+            if (pqIdentityKey != null && pqSignature != null) {
+                final Element pqIk = bundle.addChild("pq-ik");
+                pqIk.setAttribute("type", "ML-DSA-87");
+                pqIk.setContent(Base64.encodeToString(pqIdentityKey, Base64.NO_WRAP));
+                bundle.addChild("pq-sig").setContent(
+                        Base64.encodeToString(pqSignature, Base64.NO_WRAP));
+            }
+            return publish(AxolotlService.PEP_OMEMO2_BUNDLES, item, publishOptions);
+        } catch (org.signal.libsignal.protocol.InvalidKeyException e) {
+            throw new AssertionError("locally generated key is invalid", e);
+        }
+    }
+
+    /** Publish PQ-OMEMO2 device list to Namespace.OMEMO2_DEVICES. */
+    public Iq publishOmemo2DeviceIds(final Set<Integer> ids, final Bundle publishOptions) {
+        final Element item = new Element("item");
+        item.setAttribute("id", "current");
+        final Element devices = item.addChild("devices", Namespace.OMEMO2);
+        for (final Integer id : ids) {
+            devices.addChild("device").setAttribute("id", id);
+        }
+        return publish(AxolotlService.PEP_OMEMO2_DEVICE_LIST, item, publishOptions);
+    }
+
+    /** Retrieve OMEMO2 device list for a JID. */
+    public Iq retrieveOmemo2DeviceIds(final Jid to) {
+        final var packet = retrieve(AxolotlService.PEP_OMEMO2_DEVICE_LIST, null);
+        if (to != null) {
+            packet.setTo(to);
+        }
+        return packet;
+    }
+
+    /** Retrieve OMEMO2 bundle for a specific device (OMEMO2 bundles use item id = deviceId). */
+    public Iq retrieveOmemo2BundlesForDevice(final Jid to, final int deviceId) {
+        final Element itemFilter = new Element("item");
+        itemFilter.setAttribute("id", String.valueOf(deviceId));
+        final var packet = retrieve(AxolotlService.PEP_OMEMO2_BUNDLES, itemFilter);
+        packet.setTo(to);
+        return packet;
+    }
+
+    public Iq publishVerification(
+            byte[] signature, X509Certificate[] certificates, final int deviceId) {
+        final Element item = new Element("item");
+        item.setAttribute("id", "current");
+        final Element verification = item.addChild("verification", AxolotlService.PEP_PREFIX);
+        final Element chain = verification.addChild("chain");
+        for (int i = 0; i < certificates.length; ++i) {
+            try {
+                Element certificate = chain.addChild("certificate");
+                certificate.setContent(
+                        Base64.encodeToString(certificates[i].getEncoded(), Base64.NO_WRAP));
+                certificate.setAttribute("index", i);
+            } catch (CertificateEncodingException e) {
+                Log.d(Config.LOGTAG, "could not encode certificate");
+            }
+        }
+        verification
+                .addChild("signature")
+                .setContent(Base64.encodeToString(signature, Base64.NO_WRAP));
+        return publish(AxolotlService.PEP_VERIFICATION + ":" + deviceId, item);
+    }
+
+    public Iq queryMessageArchiveManagement(final MessageArchiveService.Query mam) {
+        final Iq packet = new Iq(Iq.Type.SET);
+        final Element query = packet.query(mam.version.namespace);
+        query.setAttribute("queryid", mam.getQueryId());
+        final Data data = new Data();
+        data.setFormType(mam.version.namespace);
+        if (mam.muc()) {
+            packet.setTo(mam.getWith());
+        } else if (mam.getWith() != null) {
+            data.put("with", mam.getWith().toString());
+        }
+        final long start = mam.getStart();
+        final long end = mam.getEnd();
+        if (start != 0) {
+            data.put("start", getTimestamp(start));
+        }
+        if (end != 0) {
+            data.put("end", getTimestamp(end));
+        }
+        data.submit();
+        query.addChild(data);
+        Element set = query.addChild("set", "http://jabber.org/protocol/rsm");
+        if (mam.getPagingOrder() == MessageArchiveService.PagingOrder.REVERSE) {
+            set.addChild("before").setContent(mam.getReference());
+        } else if (mam.getReference() != null) {
+            set.addChild("after").setContent(mam.getReference());
+        }
+        set.addChild("max").setContent(String.valueOf(Config.PAGE_SIZE));
+        return packet;
+    }
+
+    public Iq generateGetBlockList() {
+        final Iq iq = new Iq(Iq.Type.GET);
+        iq.addChild("blocklist", Namespace.BLOCKING);
+
+        return iq;
+    }
+
+    public Iq generateSetBlockRequest(
+            final Jid jid, final boolean reportSpam, final String serverMsgId) {
+        final Iq iq = new Iq(Iq.Type.SET);
+        final Element block = iq.addChild("block", Namespace.BLOCKING);
+        final Element item = block.addChild("item").setAttribute("jid", jid);
+        if (reportSpam) {
+            final Element report = item.addChild("report", Namespace.REPORTING);
+            report.setAttribute("reason", Namespace.REPORTING_REASON_SPAM);
+            if (serverMsgId != null) {
+                final Element stanzaId = report.addChild("stanza-id", Namespace.STANZA_IDS);
+                stanzaId.setAttribute("by", jid);
+                stanzaId.setAttribute("id", serverMsgId);
+            }
+        }
+        Log.d(Config.LOGTAG, iq.toString());
+        return iq;
+    }
+
+    public Iq generateSetUnblockRequest(final Jid jid) {
+        final Iq iq = new Iq(Iq.Type.SET);
+        final Element block = iq.addChild("unblock", Namespace.BLOCKING);
+        block.addChild("item").setAttribute("jid", jid);
+        return iq;
+    }
+
+    public Iq generateSetPassword(final Account account, final String newPassword) {
+        final Iq packet = new Iq(Iq.Type.SET);
+        packet.setTo(account.getDomain());
+        final Element query = packet.addChild("query", Namespace.REGISTER);
+        final Jid jid = account.getJid();
+        query.addChild("username").setContent(jid.getLocal());
+        query.addChild("password").setContent(newPassword);
+        return packet;
+    }
+
+    public Iq changeAffiliation(Conversation conference, Jid jid, String affiliation) {
+        List<Jid> jids = new ArrayList<>();
+        jids.add(jid);
+        return changeAffiliation(conference, jids, affiliation);
+    }
+
+    public Iq changeAffiliation(Conversation conference, List<Jid> jids, String affiliation) {
+        final Iq packet = new Iq(Iq.Type.SET);
+        packet.setTo(conference.getJid().asBareJid());
+        packet.setFrom(conference.getAccount().getJid());
+        Element query = packet.query("http://jabber.org/protocol/muc#admin");
+        for (Jid jid : jids) {
+            Element item = query.addChild("item");
+            item.setAttribute("jid", jid);
+            item.setAttribute("affiliation", affiliation);
+        }
+        return packet;
+    }
+
+    public Iq changeRole(Conversation conference, String nick, String role) {
+        final Iq packet = new Iq(Iq.Type.SET);
+        packet.setTo(conference.getJid().asBareJid());
+        packet.setFrom(conference.getAccount().getJid());
+        Element item = packet.query("http://jabber.org/protocol/muc#admin").addChild("item");
+        item.setAttribute("nick", nick);
+        item.setAttribute("role", role);
+        return packet;
+    }
+
+    public Iq moderateMessage(Account account, Message m, String reason) {
+        final var packet = new Iq(Iq.Type.SET);
+        packet.setTo(m.getConversation().getJid().asBareJid());
+        packet.setFrom(account.getJid());
+        final var moderate =
+                packet.addChild("apply-to", "urn:xmpp:fasten:0")
+                        .setAttribute("id", m.getServerMsgId())
+                        .addChild("moderate", "urn:xmpp:message-moderate:0");
+        moderate.addChild("retract", "urn:xmpp:message-retract:0");
+        moderate.addChild("reason", "urn:xmpp:message-moderate:0").setContent(reason);
+        return packet;
+    }
+
+    public Iq requestHttpUploadSlot(Jid host, DownloadableFile file, String name, String mime) {
+        final Iq packet = new Iq(Iq.Type.GET);
+        packet.setTo(host);
+        Element request = packet.addChild("request", Namespace.HTTP_UPLOAD);
+        request.setAttribute("filename", name == null ? convertFilename(file.getName()) : name);
+        request.setAttribute("size", file.getExpectedSize());
+        request.setAttribute("content-type", mime);
+        return packet;
+    }
+
+    public Iq requestHttpUploadLegacySlot(Jid host, DownloadableFile file, String mime) {
+        final Iq packet = new Iq(Iq.Type.GET);
+        packet.setTo(host);
+        Element request = packet.addChild("request", Namespace.HTTP_UPLOAD_LEGACY);
+        request.addChild("filename").setContent(convertFilename(file.getName()));
+        request.addChild("size").setContent(String.valueOf(file.getExpectedSize()));
+        request.addChild("content-type").setContent(mime);
+        return packet;
+    }
+
+    private static String convertFilename(String name) {
+        int pos = name.indexOf('.');
+        if (pos != -1) {
+            try {
+                UUID uuid = UUID.fromString(name.substring(0, pos));
+                ByteBuffer bb = ByteBuffer.wrap(new byte[16]);
+                bb.putLong(uuid.getMostSignificantBits());
+                bb.putLong(uuid.getLeastSignificantBits());
+                return Base64.encodeToString(
+                        bb.array(), Base64.URL_SAFE | Base64.NO_PADDING | Base64.NO_WRAP)
+                        + name.substring(pos);
+            } catch (Exception e) {
+                return name;
+            }
+        } else {
+            return name;
+        }
+    }
+
+    public static Iq generateCreateAccountWithCaptcha(
+            final Account account, final String id, final Data data) {
+        final Iq register = new Iq(Iq.Type.SET);
+        register.setFrom(account.getJid().asBareJid());
+        register.setTo(account.getDomain());
+        register.setId(id);
+        Element query = register.query(Namespace.REGISTER);
+        if (data != null) {
+            query.addChild(data);
+        }
+        return register;
+    }
+
+    public Iq pushTokenToAppServer(Jid appServer, String token, String deviceId) {
+        return pushTokenToAppServer(appServer, token, deviceId, null);
+    }
+
+    public Iq pushTokenToAppServer(Jid appServer, String token, String deviceId, Jid muc) {
+        final Iq packet = new Iq(Iq.Type.SET);
+        packet.setTo(appServer);
+        final Element command = packet.addChild("command", Namespace.COMMANDS);
+        command.setAttribute("node", "register-push-fcm");
+        command.setAttribute("action", "execute");
+        final Data data = new Data();
+        data.put("token", token);
+        data.put("android-id", deviceId);
+        if (muc != null) {
+            data.put("muc", muc.toString());
+        }
+        data.submit();
+        command.addChild(data);
+        return packet;
+    }
+
+    public Iq unregisterChannelOnAppServer(Jid appServer, String deviceId, String channel) {
+        final Iq packet = new Iq(Iq.Type.SET);
+        packet.setTo(appServer);
+        final Element command = packet.addChild("command", Namespace.COMMANDS);
+        command.setAttribute("node", "unregister-push-fcm");
+        command.setAttribute("action", "execute");
+        final Data data = new Data();
+        data.put("channel", channel);
+        data.put("android-id", deviceId);
+        data.submit();
+        command.addChild(data);
+        return packet;
+    }
+
+    public Iq enablePush(final Jid jid, final String node, final String secret) {
+        final Iq packet = new Iq(Iq.Type.SET);
+        Element enable = packet.addChild("enable", Namespace.PUSH);
+        enable.setAttribute("jid", jid);
+        enable.setAttribute("node", node);
+        if (secret != null) {
+            Data data = new Data();
+            data.setFormType(Namespace.PUBSUB_PUBLISH_OPTIONS);
+            data.put("secret", secret);
+            data.submit();
+            enable.addChild(data);
+        }
+        return packet;
+    }
+
+    public Iq disablePush(final Jid jid, final String node) {
+        Iq packet = new Iq(Iq.Type.SET);
+        Element disable = packet.addChild("disable", Namespace.PUSH);
+        disable.setAttribute("jid", jid);
+        disable.setAttribute("node", node);
+        return packet;
+    }
+
+    public Iq queryAffiliation(Conversation conversation, String affiliation) {
+        final Iq packet = new Iq(Iq.Type.GET);
+        packet.setTo(conversation.getJid().asBareJid());
+        packet.query("http://jabber.org/protocol/muc#admin")
+                .addChild("item")
+                .setAttribute("affiliation", affiliation);
+        return packet;
+    }
+
+    public static Bundle defaultGroupChatConfiguration() {
+        Bundle options = new Bundle();
+        options.putString("muc#roomconfig_persistentroom", "1");
+        options.putString("muc#roomconfig_membersonly", "1");
+        options.putString("muc#roomconfig_publicroom", "0");
+        options.putString("muc#roomconfig_whois", "anyone");
+        options.putString("muc#roomconfig_changesubject", "0");
+        options.putString("muc#roomconfig_allowinvites", "0");
+        options.putString("muc#roomconfig_enablearchiving", "1"); // prosody
+        options.putString("mam", "1"); // ejabberd community
+        options.putString("muc#roomconfig_mam", "1"); // ejabberd saas
+        return options;
+    }
+
+    public static Bundle defaultChannelConfiguration() {
+        Bundle options = new Bundle();
+        options.putString("muc#roomconfig_persistentroom", "1");
+        options.putString("muc#roomconfig_membersonly", "0");
+        options.putString("muc#roomconfig_publicroom", "1");
+        options.putString("muc#roomconfig_whois", "moderators");
+        options.putString("muc#roomconfig_changesubject", "0");
+        options.putString("muc#roomconfig_enablearchiving", "1"); // prosody
+        options.putString("mam", "1"); // ejabberd community
+        options.putString("muc#roomconfig_mam", "1"); // ejabberd saas
+        return options;
+    }
+
+    public static Bundle defaultStoriesConfiguration() {
+        Bundle options = new Bundle();
+        options.putString("pubsub#node_type", "leaf");
+        options.putString("pubsub#type", Namespace.PUBSUB_STORIES);
+        options.putString("pubsub#access_model", "presence");
+        options.putString("pubsub#item_expire", "86400");
+        options.putString("pubsub#persist_items", "1");
+        options.putString("pubsub#max_items", "120");
+        options.putString("pubsub#notify_retract", "1");
+        options.putString("pubsub#send_last_published_item", "on_sub_and_presence");
+        options.putString("pubsub#publish_model", "publishers");
+        return options;
+    }
+
+    public Iq createStoriesNode() {
+        final Iq iq = new Iq(Iq.Type.SET);
+        final Element pubsub = iq.addChild("pubsub", Namespace.PUBSUB);
+        pubsub.addChild("create").setAttribute("node", Namespace.PUBSUB_STORIES);
+        final Element configure = pubsub.addChild("configure");
+        // Correctly use the 'pubsub#node_config' namespace
+        final Data data = Data.create("http://jabber.org/protocol/pubsub#node_config", defaultStoriesConfiguration());
+        configure.addChild(data);
+        return iq;
+    }
+
+    public Iq requestPubsubConfiguration(Jid jid, String node) {
+        return pubsubConfiguration(jid, node, null);
+    }
+
+    public Iq publishPubsubConfiguration(Jid jid, String node, Data data) {
+        return pubsubConfiguration(jid, node, data);
+    }
+
+    private Iq pubsubConfiguration(Jid jid, String node, Data data) {
+        final Iq packet = new Iq(data == null ? Iq.Type.GET : Iq.Type.SET);
+        packet.setTo(jid);
+        Element pubsub = packet.addChild("pubsub", "http://jabber.org/protocol/pubsub#owner");
+        Element configure = pubsub.addChild("configure").setAttribute("node", node);
+        if (data != null) {
+            configure.addChild(data);
+        }
+        return packet;
+    }
+
+    public Iq queryDiscoItems(final Jid jid) {
+        final Iq packet = new Iq(Iq.Type.GET);
+        packet.setTo(jid);
+        packet.query(Namespace.DISCO_ITEMS);
+        return packet;
+    }
+
+    public Iq queryDiscoItems(Jid jid, String node) {
+        final var packet = queryDiscoItems(jid);
+        final var query = packet.query(Namespace.DISCO_ITEMS);
+        query.setAttribute("node", node);
+        return packet;
+    }
+
+    public Iq queryDiscoInfo(final Jid jid) {
+        final Iq packet = new Iq(Iq.Type.GET);
+        packet.setTo(jid);
+        packet.addChild("query", Namespace.DISCO_INFO);
+        return packet;
+    }
+
+    public Iq bobResponse(Iq request) {
+        try {
+            final var bobCid = request.findChild("data", "urn:xmpp:bob").getAttribute("cid");
+            final var cid = BobTransfer.cid(bobCid);
+            final var f = mXmppConnectionService.getFileForCid(cid);
+            if (f == null || !f.canRead()) {
+                throw new IOException("No such file");
+            } else if (f.getSize() > 129000) {
+                final var response = request.generateResponse(Iq.Type.ERROR);
+                final var error = response.addChild("error");
+                error.setAttribute("type", "cancel");
+                error.addChild("policy-violation", "urn:ietf:params:xml:ns:xmpp-stanzas");
+                return response;
+            } else {
+                final var response = request.generateResponse(Iq.Type.RESULT);
+                final var data = response.addChild("data", "urn:xmpp:bob");
+                data.setAttribute("cid", bobCid);
+                data.setAttribute("type", f.getMimeType());
+                ByteArrayOutputStream b64 = new ByteArrayOutputStream((int) f.getSize() * 2);
+                Base64OutputStream b64wrap = new Base64OutputStream(b64, Base64.NO_WRAP);
+                ByteStreams.copy(new FileInputStream(f), b64wrap);
+                b64wrap.flush();
+                b64wrap.close();
+                data.setContent(b64.toString("utf-8"));
+                return response;
+            }
+        } catch (final IOException | IllegalStateException e) {
+            final var response = request.generateResponse(Iq.Type.ERROR);
+            final var error = response.addChild("error");
+            error.setAttribute("type", "cancel");
+            error.addChild("item-not-found", "urn:ietf:params:xml:ns:xmpp-stanzas");
+            return response;
+        }
+    }
+
+    public Iq retrievePubsubItems(final Jid server, final String node) {
+        final Iq iq = new Iq(Iq.Type.GET);
+        if (server != null) {
+            iq.setTo(server);
+        }
+        final Element pubsub = iq.addChild("pubsub", Namespace.PUBSUB);
+        final Element items = pubsub.addChild("items");
+        items.setAttribute("node", node);
+        return iq;
+    }
+
+    public Iq publishPost(final Account account, final String title, final String content,
+                          final String attachmentUrl, final String attachmentType, final String postId, final String linkUrl) {
+        final Element item = new Element("item");
+        item.setAttribute("id", postId);
+        final Element entry = item.addChild("entry", Namespace.ATOM);
+
+        final String now = AbstractGenerator.getTimestamp(System.currentTimeMillis());
+        final String date = now.substring(0, 10);
+        entry.addChild("id").setContent("tag:" + account.getServer() + "," + date + ":" + postId);
+
+        entry.addChild("link")
+                .setAttribute("rel", "replies")
+                .setAttribute("title", "comments")
+                .setAttribute("href", "xmpp:" + account.getJid().asBareJid() + "?;node=urn:xmpp:microblog:0:comments/" + postId);
+
+        if (title != null) {
+            entry.addChild("title").setAttribute("type", "text").setContent(title);
+        }
+        if (content != null) {
+            entry.addChild("content").setAttribute("type", "text").setContent(content);
+        }
+        if (attachmentUrl != null && attachmentType != null) {
+            entry.addChild("link")
+                    .setAttribute("rel", "enclosure")
+                    .setAttribute("href", attachmentUrl)
+                    .setAttribute("type", attachmentType);
+        }
+        if (linkUrl != null && !linkUrl.isEmpty()) {
+            entry.addChild("link")
+                    .setAttribute("rel", "related")
+                    .setAttribute("href", linkUrl);
+        }
+        final Element author = entry.addChild("author");
+        String name = account.getDisplayName();
+        if (name == null || name.trim().isEmpty()) {
+            name = account.getJid().asBareJid().toString();
+        }
+        author.addChild("name").setContent(name);
+        author.addChild("uri").setContent("xmpp:" + account.getJid().asBareJid().toString());
+        entry.addChild("published").setContent(now);
+        entry.addChild("updated").setContent(now);
+
+        entry.addChild("generator")
+                .setAttribute("uri", "https://monocles.chat")
+                .setAttribute("version", eu.siacs.conversations.BuildConfig.VERSION_NAME)
+                .setContent("monocles chat");
+
+        return publish(Namespace.MICROBLOG, item, null);
+    }
+
+
+    public static Bundle defaultPostConfiguration() {
+        Bundle options = new Bundle();
+        options.putString("pubsub#node_type", "leaf");
+        options.putString("pubsub#type", Namespace.PUBSUB_SOCIAL_FEED);
+        options.putString("pubsub#access_model", "presence");
+        options.putString("pubsub#persist_items", "1");
+        options.putString("pubsub#deliver_payloads", "0");
+        options.putString("pubsub#send_last_published_item", "on_sub");
+        options.putString("pubsub#max_items", "max");
+        options.putString("pubsub#notify_retract", "1");
+        options.putString("pubsub#deliver_notifications", "1");
+        options.putString("pubsub#publish_model", "publishers");
+        return options;
+    }
+
+    public static Bundle defaultCommentsConfiguration() {
+        Bundle options = new Bundle();
+        options.putString("pubsub#node_type", "leaf");
+        options.putString("pubsub#type", "urn:xmpp:microblog:0:comments");
+        options.putString("pubsub#access_model", "open");
+        options.putString("pubsub#persist_items", "1");
+        options.putString("pubsub#max_items", "max");
+        options.putString("pubsub#notify_retract", "1");
+        options.putString("pubsub#deliver_notifications", "1");
+        options.putString("pubsub#deliver_payloads", "1");
+        options.putString("pubsub#send_last_published_item", "on_sub");
+        options.putString("pubsub#publish_model", "open");
+        options.putString("pubsub#itemreply", "publisher");
+        return options;
+    }
+
+    private Iq createNode(String node, Bundle options) {
+        final Iq iq = new Iq(Iq.Type.SET);
+        final Element pubsub = iq.addChild("pubsub", Namespace.PUBSUB);
+        pubsub.addChild("create").setAttribute("node", node);
+        final Element configure = pubsub.addChild("configure");
+        final Data data = Data.create("http://jabber.org/protocol/pubsub#node_config", options);
+        configure.addChild(data);
+        return iq;
+    }
+
+    public Iq createSocialFeedNode() {
+        final Iq iq = new Iq(Iq.Type.SET);
+        final Element pubsub = iq.addChild("pubsub", Namespace.PUBSUB);
+        pubsub.addChild("create").setAttribute("node", Namespace.MICROBLOG);
+        final Element configure = pubsub.addChild("configure");
+        final Data data = Data.create("http://jabber.org/protocol/pubsub#node_config", defaultPostConfiguration());
+        configure.addChild(data);
+        return iq;
+    }
+
+    public Iq publishComment(final Account account, final String node, final String title) {
+        final Iq iq = new Iq(Iq.Type.SET);
+        iq.setTo(account.getJid().asBareJid());
+        final Element pubsub = iq.addChild("pubsub", Namespace.PUBSUB);
+        final Element publish = pubsub.addChild("publish");
+        publish.setAttribute("node", node);
+        final Element item = publish.addChild("item");
+        final Element entry = item.addChild("entry", Namespace.ATOM);
+        entry.addChild("title").setContent(title);
+        final Element author = entry.addChild("author");
+        String name = account.getDisplayName();
+        if (name == null || name.trim().isEmpty()) {
+            name = account.getJid().asBareJid().toString();
+        }
+        author.addChild("name").setContent(name);
+        author.addChild("uri").setContent("xmpp:" + account.getJid().asBareJid().toString());
+        final String id = "tag:" + account.getServer() + "," + AbstractGenerator.getTimestamp(System.currentTimeMillis()) + ":" + UUID.randomUUID().toString();
+        entry.addChild("id").setContent(id);
+        final String now = AbstractGenerator.getTimestamp(System.currentTimeMillis());
+        entry.addChild("published").setContent(now);
+        entry.addChild("updated").setContent(now);
+        return iq;
+    }
+
+
+    public Iq createCommentsNode(String postId) {
+        return createNode("urn:xmpp:microblog:0:comments/" + postId, defaultCommentsConfiguration());
+    }
+
+    public Iq retractPost(final String node, final String id) {
+        final var packet = new Iq(Iq.Type.SET);
+        final Element pubsub = packet.addChild("pubsub", Namespace.PUBSUB);
+        final Element retract = pubsub.addChild("retract");
+        retract.setAttribute("node", node);
+        retract.setAttribute("notify", "true");
+        retract.addChild("item").setAttribute("id", id);
+        return packet;
+    }
+
+    public Iq generateSubscriptionIq(final Jid to, final String node, final Jid from) {
+        final Iq iq = new Iq(Iq.Type.SET);
+        iq.setTo(to);
+        final Element pubsub = iq.addChild("pubsub", Namespace.PUBSUB);
+        final Element subscribe = pubsub.addChild("subscribe");
+        subscribe.setAttribute("node", node);
+        subscribe.setAttribute("jid", from.asBareJid().toString());
+        return iq;
+    }
+
+    public Iq generateUnsubscriptionIq(final Jid to, final String node, final Jid from) {
+        final Iq iq = new Iq(Iq.Type.SET);
+        iq.setTo(to);
+        final Element pubsub = iq.addChild("pubsub", Namespace.PUBSUB);
+        final Element unsubscribe = pubsub.addChild("unsubscribe");
+        unsubscribe.setAttribute("node", node);
+        unsubscribe.setAttribute("jid", from.asBareJid().toString());
+        return iq;
+    }
+}

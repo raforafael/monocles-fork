@@ -1,0 +1,467 @@
+package eu.siacs.conversations.ui;
+
+import static android.view.View.VISIBLE;
+
+import android.Manifest;
+import android.app.Activity;
+import android.app.PendingIntent;
+import android.content.ActivityNotFoundException;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.graphics.Color;
+import android.media.MediaMetadataRetriever;
+import android.net.Uri;
+import android.os.Bundle;
+import android.provider.MediaStore;
+import android.text.Editable;
+import android.text.TextWatcher;
+import android.util.Log;
+import android.view.LayoutInflater;
+import android.view.Menu;
+import android.view.MenuItem;
+import android.view.View;
+import android.widget.ImageView;
+import android.widget.TextView;
+import android.widget.Toast;
+import android.widget.VideoView;
+
+import androidx.annotation.NonNull;
+import androidx.appcompat.app.ActionBar;
+import androidx.databinding.DataBindingUtil;
+import androidx.recyclerview.widget.LinearLayoutManager;
+
+import com.bumptech.glide.Glide;
+import com.google.android.material.bottomnavigation.BottomNavigationView;
+import com.google.android.material.dialog.MaterialAlertDialogBuilder;
+import com.google.android.material.textfield.TextInputEditText;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
+
+import eu.siacs.conversations.Config;
+import eu.siacs.conversations.R;
+import eu.siacs.conversations.databinding.ActivityStoriesBinding;
+import eu.siacs.conversations.entities.Account;
+import eu.siacs.conversations.entities.Contact;
+import eu.siacs.conversations.entities.Story;
+import eu.siacs.conversations.medialib.activities.EditActivity;
+import eu.siacs.conversations.services.XmppConnectionService;
+import eu.siacs.conversations.ui.adapter.StoryAdapter;
+import eu.siacs.conversations.ui.util.PendingItem;
+
+public class StoriesActivity extends XmppActivity implements XmppConnectionService.OnStoriesUpdate {
+
+    private static final int REQUEST_CHOOSE_STORY_IMAGE = 0x2b01;
+    private static final int REQUEST_CAMERA_PERMISSION = 0x2b03;
+    private static final int REQUEST_EDIT_STORY_IMAGE = 0x2b04;
+    private Account mSelectedAccount;
+    private final PendingItem<Uri> pendingTakePhotoUri = new PendingItem<>();
+
+    private ActivityStoriesBinding binding;
+    private StoryAdapter storyAdapter;
+    private final List<Story> stories = new ArrayList<>();
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        binding = DataBindingUtil.setContentView(this, R.layout.activity_stories);
+        Activities.setStatusAndNavigationBarColors(this, findViewById(android.R.id.content));
+        setSupportActionBar(binding.toolbar);
+        configureActionBar(getSupportActionBar());
+        binding.fabAddStory.setOnClickListener(v -> selectAccountToPublishStory());
+        storyAdapter = new StoryAdapter(this, stories);
+        binding.storiesList.setLayoutManager(new LinearLayoutManager(this));
+        binding.storiesList.setAdapter(storyAdapter);
+
+        // Bottom Navigation Setup
+        BottomNavigationView bottomNavigationView = findViewById(R.id.bottom_navigation);
+        bottomNavigationView.setBackgroundColor(Color.TRANSPARENT);
+        bottomNavigationView.setOnItemSelectedListener(item -> {
+            final int navId = item.getItemId();
+            if (navId == R.id.chats) {
+                startActivity(new Intent(getApplicationContext(), ConversationsActivity.class));
+                overridePendingTransition(R.animator.fade_in, R.animator.fade_out);
+                return true;
+            } else if (navId == R.id.feeds) {
+                Intent i = new Intent(getApplicationContext(), PostsActivity.class);
+                i.putExtra("show_nav_bar", true);
+                startActivity(i);
+                overridePendingTransition(R.animator.fade_in, R.animator.fade_out);
+                return true;
+            } else if (navId == R.id.stories) {
+                return true;
+            } else if (navId == R.id.calls) {
+                Intent callsIntent = new Intent(getApplicationContext(), CallsActivity.class);
+                callsIntent.putExtra("show_nav_bar", true);
+                startActivity(callsIntent);
+                overridePendingTransition(R.animator.fade_in, R.animator.fade_out);
+                return true;
+            } else {
+                throw new IllegalStateException("Unexpected value: " + item.getItemId());
+            }
+        });
+    }
+
+    @Override
+    public void onStart() {
+        super.onStart();
+        BottomNavigationView bottomNavigationView = findViewById(R.id.bottom_navigation);
+        bottomNavigationView.setSelectedItemId(R.id.stories);
+
+        if (getBooleanPreference("show_nav_bar", R.bool.show_nav_bar) && getIntent().getBooleanExtra("show_nav_bar", false)) {
+            bottomNavigationView.setVisibility(VISIBLE);
+        } else {
+            bottomNavigationView.setVisibility(View.GONE);
+        }
+        if (xmppConnectionService != null) {
+            xmppConnectionService.setOnStoriesUpdateListener(this);
+            androidx.preference.PreferenceManager.getDefaultSharedPreferences(this).edit().putLong("last_read_story_timestamp", System.currentTimeMillis()).apply();
+            refresh();
+        }
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        if (xmppConnectionService != null) {
+            xmppConnectionService.removeOnStoriesUpdateListener(this);
+        }
+    }
+
+    @Override
+    protected void onBackendConnected() {
+        if (xmppConnectionService != null) {
+            xmppConnectionService.setOnStoriesUpdateListener(this);
+            refresh();
+        }
+        refreshUiReal();
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (findViewById(R.id.bottom_navigation).getVisibility() == VISIBLE) {
+            Intent intent = new Intent(this, ConversationsActivity.class);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION);
+            startActivity(intent);
+            overridePendingTransition(R.animator.fade_in, R.animator.fade_out);
+        }
+
+        super.onBackPressed();
+    }
+
+    @Override
+    public boolean onCreateOptionsMenu(Menu menu) {
+        getMenuInflater().inflate(R.menu.activity_stories, menu);
+        return true;
+    }
+
+    @Override
+    public boolean onOptionsItemSelected(MenuItem item) {
+        if (item.getItemId() == R.id.action_settings) {
+            startActivity(new Intent(this, eu.siacs.conversations.ui.activity.SettingsActivity.class));
+            return true;
+        }
+        return super.onOptionsItemSelected(item);
+    }
+
+    private void publish(Uri uri, String mimeType) {
+        if (uri == null || mSelectedAccount == null) {
+            return;
+        }
+        showCreateStoryDialog(uri, mimeType);
+    }
+
+    private void showCreateStoryDialog(Uri uri, String mimeType) {
+        View dialogView = LayoutInflater.from(this).inflate(R.layout.dialog_create_story, null);
+        ImageView storyPreviewImage = dialogView.findViewById(R.id.story_preview_image);
+        VideoView storyPreviewVideo = dialogView.findViewById(R.id.story_preview_video);
+        TextView publishInfoText = dialogView.findViewById(R.id.publish_info_text);
+        TextInputEditText titleEditText = dialogView.findViewById(R.id.title_edit_text);
+
+        final TextWatcher textWatcher = new TextWatcher() {
+            private String before;
+
+            @Override
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {
+                before = s.toString();
+            }
+
+            @Override
+            public void onTextChanged(CharSequence s, int start, int before, int count) {
+                // No action needed here
+            }
+
+            @Override
+            public void afterTextChanged(Editable s) {
+                if (titleEditText.getLineCount() > 20) {
+                    titleEditText.removeTextChangedListener(this);
+                    titleEditText.setText(before);
+                    titleEditText.setSelection(before.length());
+                    titleEditText.addTextChangedListener(this);
+                }
+            }
+        };
+        titleEditText.addTextChangedListener(textWatcher);
+
+        long subscriberCount = mSelectedAccount.getRoster().getContacts().stream()
+                .filter(c -> c.getOption(Contact.Options.FROM))
+                .count();publishInfoText.setText(getResources().getQuantityString(R.plurals.publishing_to_x_contacts, (int) subscriberCount, (int) subscriberCount));
+
+        if (mimeType.startsWith("video/")) {
+            storyPreviewVideo.setVisibility(View.VISIBLE);
+            storyPreviewVideo.setVideoURI(uri);
+            storyPreviewVideo.setOnPreparedListener(mp -> {
+                mp.setLooping(true);
+                storyPreviewVideo.start();
+            });
+        } else {
+            storyPreviewImage.setVisibility(View.VISIBLE);
+            Glide.with(this).load(uri).into(storyPreviewImage);
+        }
+
+        new MaterialAlertDialogBuilder(this)
+                .setTitle(R.string.add_story_title)
+                .setView(dialogView)
+                .setNegativeButton(R.string.cancel, null)
+                .setPositiveButton(R.string.publish, (dialog2, which2) -> {
+                    final String title = titleEditText.getText().toString();
+                    Toast.makeText(this, R.string.uploading_story, Toast.LENGTH_SHORT).show();
+                    xmppConnectionService.uploadFileForUrl(mSelectedAccount, uri, mimeType, new UiCallback<String>() {
+                        @Override
+                        public void success(String url) {
+                            xmppConnectionService.publishStory(mSelectedAccount, url, mimeType, title, new UiCallback<Void>() {
+                                @Override
+                                public void success(Void aVoid) {
+                                    runOnUiThread(() -> Toast.makeText(StoriesActivity.this, R.string.story_published, Toast.LENGTH_SHORT).show());
+                                }
+
+                                @Override
+                                public void error(int errorCode, Void object) {
+                                    runOnUiThread(() -> Toast.makeText(StoriesActivity.this, errorCode, Toast.LENGTH_SHORT).show());
+                                }
+
+                                @Override
+                                public void userInputRequired(PendingIntent pi, Void object) {
+                                    // not used
+                                }
+                            });
+                        }
+
+                        @Override
+                        public void error(int errorCode, String object) {
+                            runOnUiThread(() -> Toast.makeText(StoriesActivity.this, errorCode, Toast.LENGTH_SHORT).show());
+                        }
+
+                        @Override
+                        public void userInputRequired(PendingIntent pi, String object) {
+                            // not used
+                        }
+                    });
+                })
+                .create()
+                .show();
+    }
+
+    @Override
+    public void onActivityResult(int requestCode, int resultCode, final Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (resultCode == Activity.RESULT_OK) {
+            if (requestCode == REQUEST_CHOOSE_STORY_IMAGE) {
+                Uri uri;
+                if (data != null && data.getData() != null) {
+                    uri = data.getData();
+                } else if (pendingTakePhotoUri.peek() != null) {
+                    uri = pendingTakePhotoUri.pop();
+                } else {
+                    return;
+                }
+                if (mSelectedAccount != null) {
+                    String mimeType = getContentResolver().getType(uri);
+                    if (mimeType != null && mimeType.startsWith("video/")) {
+                        try {
+                            MediaMetadataRetriever retriever = new MediaMetadataRetriever();
+                            retriever.setDataSource(this, uri);
+                            String time = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION);
+                            long durationMs = 0;
+                            if (time != null) {
+                                durationMs = Long.parseLong(time);
+                            }
+                            retriever.release();
+                            if (durationMs > 60000) {
+                                Toast.makeText(this, R.string.video_too_long_for_story, Toast.LENGTH_SHORT).show();
+                            } else {
+                                publish(uri, mimeType);
+                            }
+                        } catch (Exception e) {
+                            Log.d(Config.LOGTAG, "Could not determine video duration", e);
+                            Toast.makeText(this, R.string.error_retrieving_video_duration, Toast.LENGTH_SHORT).show();
+                        }
+                    } else {
+                        Intent intent = new Intent(this, EditActivity.class);
+                        intent.setData(uri);
+                        startActivityForResult(intent, REQUEST_EDIT_STORY_IMAGE);
+                    }
+                }
+            } else if (requestCode == REQUEST_EDIT_STORY_IMAGE) {
+                Uri uri = data != null ? (Uri) data.getParcelableExtra(EditActivity.KEY_EDITED_URI) : null;
+                if (uri == null && data != null) {
+                    uri = data.getData();
+                }
+                if (uri != null) {
+                    String mimeType = data.getType();
+                    if (mimeType == null) {
+                        mimeType = getContentResolver().getType(uri);
+                    }
+                    if (mimeType == null) {
+                        mimeType = "image/jpeg";
+                    }
+                    publish(uri, mimeType);
+                }
+            }
+        } else {
+            pendingTakePhotoUri.pop();
+        }
+    }
+
+    private void selectAccountToPublishStory() {
+        final List<Account> accounts = xmppConnectionService.getAccounts().stream().filter(account -> account.getStatus() == Account.State.ONLINE).collect(Collectors.toList());
+        if (accounts.isEmpty()) {
+            Toast.makeText(this, R.string.no_active_account, Toast.LENGTH_SHORT).show();
+        } else if (accounts.size() == 1) {
+            openStoryImagePicker(accounts.get(0));
+        } else {
+            final AtomicReference<Account> selectedAccount = new AtomicReference<>(accounts.get(0));
+            final MaterialAlertDialogBuilder alertDialogBuilder = new MaterialAlertDialogBuilder(this);
+            alertDialogBuilder.setTitle(R.string.choose_account);
+            final String[] asStrings =
+                    accounts.stream().map(a -> a.getJid().asBareJid().toString()).toArray(String[]::new);
+            alertDialogBuilder.setSingleChoiceItems(
+                    asStrings, 0, (dialog, which) -> selectedAccount.set(accounts.get(which)));
+            alertDialogBuilder.setNegativeButton(R.string.cancel, null);
+            alertDialogBuilder.setPositiveButton(
+                    R.string.ok, (dialog, which) -> openStoryImagePicker(selectedAccount.get()));
+            alertDialogBuilder.create().show();
+        }
+    }
+
+
+    private void openStoryImagePicker(Account account) {
+        this.mSelectedAccount = account;
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.CAMERA}, REQUEST_CAMERA_PERMISSION);
+        } else {
+            final Intent galleryIntent = new Intent(Intent.ACTION_GET_CONTENT);
+            galleryIntent.setType("image/*,video/*");
+            galleryIntent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"image/*", "video/*"});
+
+            final Intent cameraIntent = new Intent(android.provider.MediaStore.ACTION_IMAGE_CAPTURE);
+            final Uri takePhotoUri = xmppConnectionService.getFileBackend().getTakePhotoUri();
+            pendingTakePhotoUri.push(takePhotoUri);
+            cameraIntent.putExtra(MediaStore.EXTRA_OUTPUT, takePhotoUri);
+
+            final Intent videoIntent = new Intent(android.provider.MediaStore.ACTION_VIDEO_CAPTURE);
+
+            final Intent chooserIntent = Intent.createChooser(galleryIntent, getString(R.string.perform_action_with));
+            chooserIntent.putExtra(Intent.EXTRA_INITIAL_INTENTS, new Intent[]{cameraIntent, videoIntent});
+
+            try {
+                startActivityForResult(chooserIntent, REQUEST_CHOOSE_STORY_IMAGE);
+            } catch (final ActivityNotFoundException e) {
+                Toast.makeText(this, R.string.no_application_found, Toast.LENGTH_LONG).show();
+            }
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQUEST_CAMERA_PERMISSION) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                openStoryImagePicker(mSelectedAccount);
+            }
+        }
+    }
+
+    @Override
+    protected void refreshUiReal() {
+        if (xmppConnectionService == null) {
+            return;
+        }
+
+        ActionBar actionBar = getSupportActionBar();
+
+        // Show badge for unread message in bottom nav
+        int unreadCount = xmppConnectionService.unreadCount();
+        BottomNavigationView bottomnav = findViewById(R.id.bottom_navigation);
+        var bottomBadge = bottomnav.getOrCreateBadge(R.id.chats);
+        bottomBadge.setNumber(unreadCount);
+        bottomBadge.setVisible(unreadCount > 0);
+        bottomBadge.setHorizontalOffset(20);
+
+        // Show badge for new stories in bottom nav
+        long lastRead = getPreferences().getLong("last_read_story_timestamp", 0);
+        final long twentyFourHoursAgo = System.currentTimeMillis() - 86400000;
+        boolean hasNewStories = xmppConnectionService.getStories().stream().anyMatch(s -> s.getPublished() > lastRead && s.getPublished() >= twentyFourHoursAgo);
+        var storiesBadge = bottomnav.getOrCreateBadge(R.id.stories);
+        storiesBadge.setVisible(hasNewStories);
+
+        // Show badge for new posts in bottom nav
+        long lastReadPosts = getPreferences().getLong("last_read_post_timestamp", 0);
+        boolean hasNewPosts = xmppConnectionService.databaseBackend.getPosts().stream().anyMatch(p -> p.getPublished() != null && p.getPublished().getTime() > lastReadPosts);
+        var postsBadge = bottomnav.getOrCreateBadge(R.id.feeds);
+        postsBadge.setVisible(hasNewPosts);
+
+        // Show badge for missed calls in bottom nav
+        boolean hasNewMissedCalls = xmppConnectionService.getNotificationService().hasNewMissedCalls();
+        var callsBadge = bottomnav.getOrCreateBadge(R.id.calls);
+        callsBadge.setVisible(hasNewMissedCalls);
+
+        boolean showNavBar = bottomnav.getVisibility() == VISIBLE;
+        if (actionBar != null) {
+            actionBar.setHomeButtonEnabled(!showNavBar);
+            actionBar.setDisplayHomeAsUpEnabled(!showNavBar);
+        }
+        refresh();
+    }
+
+    private void refresh() {
+        if (xmppConnectionService == null) {
+            return;
+        }
+        this.stories.clear();
+        long twentyFourHoursAgo = System.currentTimeMillis() - 86400000;
+        this.stories.addAll(
+                this.xmppConnectionService.getStories().stream()
+                        .filter(s -> s.getPublished() >= twentyFourHoursAgo)
+                        .collect(Collectors.toMap(
+                                story -> story.getContact().asBareJid(),
+                                story -> story,
+                                (a, b) -> a.getPublished() > b.getPublished() ? a : b
+                        ))
+                        .values()
+        );
+        Collections.sort(this.stories, (a, b) -> Long.compare(b.getPublished(), a.getPublished()));
+        storyAdapter.notifyDataSetChanged();
+
+        final boolean hasOnlineAccounts = xmppConnectionService.getAccounts().stream().anyMatch(account -> account.getStatus() == Account.State.ONLINE);
+
+        if (!hasOnlineAccounts && this.stories.isEmpty()) {
+            binding.storiesList.setVisibility(View.GONE);
+            binding.fabAddStory.setVisibility(View.GONE);
+            binding.placeholder.setVisibility(View.VISIBLE);
+            binding.placeholder.setText(R.string.no_active_account_to_show_stories);
+        } else {
+            binding.placeholder.setVisibility(View.GONE);
+            binding.fabAddStory.setVisibility(hasOnlineAccounts ? View.VISIBLE : View.GONE);
+            binding.storiesList.setVisibility(this.stories.isEmpty() ? View.GONE : View.VISIBLE);
+        }
+    }
+
+    @Override
+    public void onStoriesUpdate() {
+        runOnUiThread(this::refresh);
+    }
+}
