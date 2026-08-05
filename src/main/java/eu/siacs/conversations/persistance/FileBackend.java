@@ -472,7 +472,28 @@ public class FileBackend {
         Message.FileParams fileParams = new Message.FileParams();
         fileParams.url = url;
         fileParams.size = size;
+        // fork: use the filename from the upload URL so received files keep the sender's
+        // original name instead of the internal content-hash name.
+        final String urlName = getFilenameFromUrl(url);
+        if (urlName != null) fileParams.setName(urlName);
         message.setFileParams(fileParams);
+    }
+
+    /** Extracts the file name from an upload URL (last path segment, URL-decoded, sanitized). */
+    public static String getFilenameFromUrl(String url) {
+        if (url == null) return null;
+        final int query = url.indexOf('?');
+        final String path = query >= 0 ? url.substring(0, query) : url;
+        final int slash = path.lastIndexOf('/');
+        if (slash == -1 || slash == path.length() - 1) return null;
+        String name = path.substring(slash + 1);
+        if (name.isEmpty()) return null;
+        try {
+            name = java.net.URLDecoder.decode(name, "UTF-8");
+        } catch (final Exception ignored) {
+        }
+        name = name.replace('/', '_').replace('\\', '_');
+        return name.isEmpty() ? null : name;
     }
 
     public Bitmap getPreviewForUri(Attachment attachment, int size, boolean cacheOnly) {
@@ -757,10 +778,15 @@ public class FileBackend {
 
         File parentDirectory =
                 Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
-        File output = new File(parentDirectory, input.getName());
+        // fork: save to Downloads with the original filename when we have it
+        String displayName = input.getName();
+        if (m.getFileParams() != null && m.getFileParams().getName() != null) {
+            displayName = m.getFileParams().getName().replace('/', '_').replace('\\', '_');
+        }
+        File output = new File(parentDirectory, displayName);
         int counter = 1;
         while (output.exists()) {
-            output = new File(parentDirectory, "(" + counter + ") " + input.getName());
+            output = new File(parentDirectory, "(" + counter + ") " + displayName);
             counter++;
         }
 
@@ -2168,7 +2194,11 @@ public class FileBackend {
         if (url != null) {
             fileParams.url = url;
         }
-        if (fileParams.getName() == null) fileParams.setName(file.getName());
+        if (fileParams.getName() == null) {
+            // fork: prefer the original filename from the URL over the internal hash name
+            final String urlName = getFilenameFromUrl(fileParams.url);
+            fileParams.setName(urlName != null ? urlName : file.getName());
+        }
         fileParams.setMediaType(mime);
         if (encrypted && !file.exists()) {
             Log.d(Config.LOGTAG, "skipping updateFileParams because file is encrypted");
