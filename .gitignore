@@ -64,7 +64,7 @@ crowdin.properties
 /monocleschatFree/release/baselineProfiles/1/Conversations-monocleschat-free-x86_64-release.dm
 /monocleschatFree/release/output-metadata.json
 deps/libsignal/java/local.properties
-gradle/
+
 gradle/caches/
 gradle/wrapper/dists/
 *.keystore
