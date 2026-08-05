@@ -26,6 +26,12 @@ jobs:
           ls -la deps/libsignal 2>&1 | head -20
           ls deps/libsignal/java 2>&1 | head -20
 
+      - name: Install protoc (needed by libsignal Rust build)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          protoc --version
+
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
