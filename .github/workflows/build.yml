@@ -16,10 +16,15 @@ jobs:
     env:
       CARGO_BUILD_JOBS: 2   # keep the Rust compile from hogging all cores
     steps:
-      - name: Checkout fork (incl. libsignal submodule)
+      - name: Checkout fork
         uses: actions/checkout@v4
-        with:
-          submodules: recursive   # deps/libsignal -> codeberg.org/monocles/pq-omemo-2
+
+      - name: Fetch libsignal submodule (PQ-OMEMO2 crypto)
+        run: |
+          git submodule init
+          git submodule update --recursive --depth 1
+          ls -la deps/libsignal 2>&1 | head -20
+          ls deps/libsignal/java 2>&1 | head -20
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
