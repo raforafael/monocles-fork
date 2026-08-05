@@ -9127,14 +9127,6 @@ public class XmppConnectionService extends Service {
                 } else {
                     getFileBackend().copyFileToPrivateStorage(file, uri);
                 }
-            } catch (FileBackend.ImageCompressionException e) {
-                Log.d(Config.LOGTAG, "unable to decode image for story, uploading raw", e);
-                try {
-                    getFileBackend().copyFileToPrivateStorage(file, uri);
-                } catch (FileBackend.FileCopyException ex) {
-                    callback.error(ex.getResId(), null);
-                    return;
-                }
             } catch (final FileBackend.FileCopyException e) {
                 callback.error(e.getResId(), null);
                 return;
