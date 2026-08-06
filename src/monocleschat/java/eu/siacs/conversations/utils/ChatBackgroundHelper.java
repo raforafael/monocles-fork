@@ -335,5 +335,3 @@ public class ChatBackgroundHelper {
         }
     }
 }
-
-// <3
