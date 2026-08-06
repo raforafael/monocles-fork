@@ -553,6 +553,9 @@ public class MessageParser extends AbstractParser
                 finishedMessage.setSubject(el.getContent());
             } else if ("thread".equals(elName)) {
                 finishedMessage.addPayload(el);
+            } else if ("background".equals(elName) && Namespace.CHAT_BACKGROUND.equals(elNs)) {
+                // fork: synced chat background marker
+                finishedMessage.setChatBackground(true);
             } else if ("replace".equals(elName) && "urn:xmpp:message-correct:0".equals(elNs)) {
                 finishedMessage.addPayload(el);
             } else if ("retract".equals(elName) && "urn:xmpp:message-retract:1".equals(elNs)) {

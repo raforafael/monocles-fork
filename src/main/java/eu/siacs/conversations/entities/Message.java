@@ -171,6 +171,9 @@ public class Message extends AbstractEntity implements AvatarService.Avatarable 
     protected boolean carbon = false;
     private boolean oob = false;
     protected List<Element> payloads = new ArrayList<>();
+
+    // fork: marks a message that carries a synced chat background
+    protected boolean chatBackground = false;
     protected List<Edit> edits = new ArrayList<>();
     protected String relativeFilePath;
     protected boolean read = true;
@@ -1476,6 +1479,14 @@ public class Message extends AbstractEntity implements AvatarService.Avatarable 
         if (el == null) return;
 
         this.payloads.add(el);
+    }
+
+    public synchronized boolean isChatBackground() {
+        return chatBackground;
+    }
+
+    public synchronized void setChatBackground(final boolean chatBackground) {
+        this.chatBackground = chatBackground;
     }
 
     public synchronized List<Element> getPayloads() {
