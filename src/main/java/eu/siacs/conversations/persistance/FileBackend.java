@@ -483,7 +483,10 @@ public class FileBackend {
     public static String getFilenameFromUrl(String url) {
         if (url == null) return null;
         final int query = url.indexOf('?');
-        final String path = query >= 0 ? url.substring(0, query) : url;
+        String path = query >= 0 ? url.substring(0, query) : url;
+        // strip the AES-GCM key reference (everything after '#') — not part of the filename
+        final int fragment = path.indexOf('#');
+        if (fragment >= 0) path = path.substring(0, fragment);
         final int slash = path.lastIndexOf('/');
         if (slash == -1 || slash == path.length() - 1) return null;
         String name = path.substring(slash + 1);
@@ -495,7 +498,7 @@ public class FileBackend {
         name = name.replace('/', '_').replace('\\', '_');
         return name.isEmpty() ? null : name;
     }
-
+    
     public Bitmap getPreviewForUri(Attachment attachment, int size, boolean cacheOnly) {
         final String key = "attachment_" + attachment.getUuid().toString() + "_" + size;
         final LruCache<String, Drawable> cache = mXmppConnectionService.getDrawableCache();
