@@ -335,4 +335,3 @@ public class ChatBackgroundHelper {
         }
     }
 }
- print(Hello, World!)
