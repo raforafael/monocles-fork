@@ -9,9 +9,9 @@ import com.google.common.base.Strings;
 import com.google.common.io.ByteStreams;
 import com.google.common.primitives.Longs;
 
-import java.io.File;
+
 import java.io.FileInputStream;
-import java.io.FileOutputStream;
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -227,27 +227,7 @@ public class HttpDownloadConnection implements Transferable {
             tmp.delete();
             message.setDeleted(true);
         }
-        // fork: a synced chat background — save it into the per-chat backgrounds folder
-        if (message.isChatBackground() && file != null && file.exists()) {
-            final String uuid =
-                    message.getConversation() == null ? null : message.getConversation().getUuid();
-            if (uuid != null) {
-                try {
-                    final File bgFile = FileBackend.getBackgroundFile(mXmppConnectionService, uuid);
-                    if (bgFile.getParentFile() != null) bgFile.getParentFile().mkdirs();
-                    try (final InputStream is = new FileInputStream(file);
-                            final OutputStream os = new FileOutputStream(bgFile)) {
-                        ByteStreams.copy(is, os);
-                    }
-                    Log.d(Config.LOGTAG, "applied synced chat background for " + uuid);
-                    // fork: refresh the UI so an already-open chat shows the new background
-                    // right away instead of only after reopening.
-                    mXmppConnectionService.updateConversationUi();
-                } catch (final IOException e) {
-                    Log.d(Config.LOGTAG, "unable to apply synced chat background", e);
-                }
-            }
-        }
+
         message.setTransferable(null);
         mXmppConnectionService.updateMessage(message);
         mHttpConnectionManager.finishConnection(this);

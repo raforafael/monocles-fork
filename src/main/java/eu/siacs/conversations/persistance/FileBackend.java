@@ -1771,24 +1771,6 @@ public class FileBackend {
         return rendered;
     }
 
-    /**
-     * Fork: per-conversation chat background file, mirrors ChatBackgroundHelper paths so a
-     * received synced background can be written from the download path (main source set).
-     */
-    public static File getBackgroundFile(final Context context, final String conversationUuid) {
-        if (conversationUuid == null) {
-            return new File(
-                    context.getFilesDir() + File.separator + "backgrounds" + File.separator + "bg.jpg");
-        }
-        return new File(
-                context.getFilesDir()
-                        + File.separator
-                        + "backgrounds"
-                        + File.separator
-                        + "bg_"
-                        + conversationUuid
-                        + ".jpg");
-    }
 
     public Uri getTakePhotoUri() {
         final String filename =

@@ -28,12 +28,7 @@ import java.io.OutputStream;
 
 import eu.siacs.conversations.Config;
 import eu.siacs.conversations.R;
-import eu.siacs.conversations.entities.Conversation;
-import eu.siacs.conversations.entities.Message;
-import eu.siacs.conversations.services.XmppConnectionService;
-import eu.siacs.conversations.ui.fragment.settings.InterfaceSettingsFragment;
-import eu.siacs.conversations.xml.Element;
-import eu.siacs.conversations.xml.Namespace;
+
 
 public class ChatBackgroundHelper {
     public static final int REQUEST_IMPORT_BACKGROUND = 0xbf8704;
@@ -306,32 +301,5 @@ public class ChatBackgroundHelper {
         return false;
     }
 
-    /**
-     * Fork: send the just-set chat background to the other participant as a special file
-     * message. The marker payload rides inside the encrypted envelope for OMEMO2 chats and
-     * as a plaintext child otherwise; the receiving fork applies it automatically.
-     */
-    public static void sendChatBackground(
-            final XmppConnectionService service,
-            final Conversation conversation,
-            final File bgFile) {
-        if (service == null || conversation == null || bgFile == null || !bgFile.exists()) {
-            return;
-        }
-        try {
-            final Message message =
-                    new Message(conversation, "", conversation.getNextEncryption());
-            if (!Message.configurePrivateFileMessage(message)) {
-                message.setCounterpart(conversation.getNextCounterpart());
-            }
-            message.setType(Message.TYPE_FILE);
-            message.setRelativeFilePath(bgFile.getAbsolutePath());
-            service.getFileBackend().updateFileParams(message);
-            message.addPayload(new Element("background", Namespace.CHAT_BACKGROUND));
-            service.sendMessage(message);
-            Log.d(Config.LOGTAG, "sent synced chat background to " + conversation.getName());
-        } catch (final Exception e) {
-            Log.d(Config.LOGTAG, "could not send synced chat background", e);
-        }
-    }
+
 }

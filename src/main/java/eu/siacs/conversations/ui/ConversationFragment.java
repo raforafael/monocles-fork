@@ -2007,15 +2007,7 @@ public class ConversationFragment extends XmppFragment
                     Intent resultIntent = new Intent();
                     resultIntent.setData(uri);
                     if (conversation != null && conversation.getUuid() != null) ChatBackgroundHelper.onActivityResult(activity, ChatBackgroundHelper.REQUEST_IMPORT_BACKGROUND, resultCode, resultIntent, conversation.getUuid());
-                    // fork: auto-sync the chat background to the contact (1:1 chats only)
-                    if (conversation != null
-                            && conversation.getMode() == Conversation.MODE_SINGLE
-                            && resultCode == Activity.RESULT_OK) {
-                        final java.io.File bgFile = ChatBackgroundHelper.getBgFile(activity, conversation.getUuid());
-                        if (bgFile.exists()) {
-                            ChatBackgroundHelper.sendChatBackground(activity.xmppConnectionService, conversation, bgFile);
-                        }
-                    }
+
                 }
                 return;
             }

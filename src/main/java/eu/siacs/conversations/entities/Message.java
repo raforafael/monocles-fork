@@ -172,8 +172,7 @@ public class Message extends AbstractEntity implements AvatarService.Avatarable 
     private boolean oob = false;
     protected List<Element> payloads = new ArrayList<>();
 
-    // fork: marks a message that carries a synced chat background
-    protected boolean chatBackground = false;
+
     protected List<Edit> edits = new ArrayList<>();
     protected String relativeFilePath;
     protected boolean read = true;
@@ -1481,21 +1480,7 @@ public class Message extends AbstractEntity implements AvatarService.Avatarable 
         this.payloads.add(el);
     }
 
-    public synchronized boolean isChatBackground() {
-        if (chatBackground) return true;
-        // fork: the runtime flag can be lost after a DB reload; fall back to the marker
-        // payload, which is persisted with the message.
-        for (final Element el : payloads) {
-            if ("background".equals(el.getName()) && Namespace.CHAT_BACKGROUND.equals(el.getNamespace())) {
-                return true;
-            }
-        }
-        return false;
-    }
 
-    public synchronized void setChatBackground(final boolean chatBackground) {
-        this.chatBackground = chatBackground;
-    }
 
     public synchronized List<Element> getPayloads() {
         return new ArrayList<>(this.payloads);

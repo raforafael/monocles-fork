@@ -137,6 +137,5 @@ public final class Namespace {
     public static final String ENTITY_CAPABILITIES_2 = "urn:xmpp:caps";
     public static final String LIVE_LOCATION = "urn:xmpp:live-location:0";
 
-    // fork: marker for synced chat backgrounds (sent as a message payload)
-    public static final String CHAT_BACKGROUND = "urn:monocles:background:0";
+
 }
