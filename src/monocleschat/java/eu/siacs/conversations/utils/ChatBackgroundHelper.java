@@ -335,4 +335,3 @@ public class ChatBackgroundHelper {
         }
     }
 }
- ## monocles fork
