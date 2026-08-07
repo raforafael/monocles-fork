@@ -1482,7 +1482,15 @@ public class Message extends AbstractEntity implements AvatarService.Avatarable 
     }
 
     public synchronized boolean isChatBackground() {
-        return chatBackground;
+        if (chatBackground) return true;
+        // fork: the runtime flag can be lost after a DB reload; fall back to the marker
+        // payload, which is persisted with the message.
+        for (final Element el : payloads) {
+            if ("background".equals(el.getName()) && Namespace.CHAT_BACKGROUND.equals(el.getNamespace())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public synchronized void setChatBackground(final boolean chatBackground) {

@@ -240,6 +240,9 @@ public class HttpDownloadConnection implements Transferable {
                         ByteStreams.copy(is, os);
                     }
                     Log.d(Config.LOGTAG, "applied synced chat background for " + uuid);
+                    // fork: refresh the UI so an already-open chat shows the new background
+                    // right away instead of only after reopening.
+                    mXmppConnectionService.updateConversationUi();
                 } catch (final IOException e) {
                     Log.d(Config.LOGTAG, "unable to apply synced chat background", e);
                 }

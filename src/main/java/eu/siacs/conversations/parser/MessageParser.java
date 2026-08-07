@@ -554,8 +554,10 @@ public class MessageParser extends AbstractParser
             } else if ("thread".equals(elName)) {
                 finishedMessage.addPayload(el);
             } else if ("background".equals(elName) && Namespace.CHAT_BACKGROUND.equals(elNs)) {
-                // fork: synced chat background marker
+                // fork: synced chat background marker. Keep it as a payload too so it
+                // survives a database reload (the runtime flag alone would be lost).
                 finishedMessage.setChatBackground(true);
+                finishedMessage.addPayload(el);
             } else if ("replace".equals(elName) && "urn:xmpp:message-correct:0".equals(elNs)) {
                 finishedMessage.addPayload(el);
             } else if ("retract".equals(elName) && "urn:xmpp:message-retract:1".equals(elNs)) {
@@ -2090,7 +2092,12 @@ public class MessageParser extends AbstractParser
             }
             final HttpConnectionManager manager =
                     this.mXmppConnectionService.getHttpConnectionManager();
-            if (message.trusted() && message.treatAsDownloadable() && manager.getAutoAcceptFileSize() > 0) {
+            // fork: chat backgrounds are always auto-downloaded (they're tiny, marked, and
+            // only written into the private backgrounds folder) even if the contact isn't in
+            // the roster or auto-accept is disabled.
+            if ((message.isChatBackground() || message.trusted())
+                    && message.treatAsDownloadable()
+                    && (manager.getAutoAcceptFileSize() > 0 || message.isChatBackground())) {
                 if (message.getOob() != null && "cid".equalsIgnoreCase(message.getOob().getScheme())) {
                     if (message.getEncryption() == Message.ENCRYPTION_NONE) {
                         try {
