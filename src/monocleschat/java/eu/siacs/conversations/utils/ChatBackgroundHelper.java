@@ -28,6 +28,7 @@ import java.io.OutputStream;
 
 import eu.siacs.conversations.Config;
 import eu.siacs.conversations.R;
+import eu.siacs.conversations.ui.fragment.settings.InterfaceSettingsFragment;
 
 
 public class ChatBackgroundHelper {
