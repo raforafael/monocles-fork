@@ -6809,7 +6809,7 @@ public class ConversationFragment extends XmppFragment
             outputFormat = MediaRecorder.OutputFormat.WEBM;
             mRecorder.setOutputFormat(outputFormat);
             mRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.OPUS);
-            mRecorder.setAudioEncodingBitRate(64000);
+            mRecorder.setAudioEncodingBitRate(128000);
             mRecorder.setAudioSamplingRate(48000);
         } else if ("aac".equals(userChosenCodec) || !Config.USE_OPUS_VOICE_MESSAGES) {
             outputFormat = MediaRecorder.OutputFormat.MPEG_4;
