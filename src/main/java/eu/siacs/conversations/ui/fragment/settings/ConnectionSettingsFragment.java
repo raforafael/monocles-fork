@@ -20,6 +20,7 @@ import eu.siacs.conversations.AppSettings;
 import eu.siacs.conversations.Config;
 import eu.siacs.conversations.R;
 import eu.siacs.conversations.entities.Account;
+import eu.siacs.conversations.services.KeepAliveAudioService;
 import eu.siacs.conversations.services.QuickConversationsService;
 import eu.siacs.conversations.ui.activity.SettingsActivity;
 import eu.siacs.conversations.utils.ChatBackgroundHelper;
@@ -118,6 +119,10 @@ public class ConnectionSettingsFragment extends XmppPreferenceFragment {
             }
             case AppSettings.SHOW_CONNECTION_OPTIONS, AppSettings.PREFER_IPV6, "dns_server_ipv4", "dns_server_ipv6", AppSettings.CUSTOM_RESOURCE_NAME -> {
                 reconnectAccounts();
+            }
+            // FORK EDIT D: start/stop the silent-audio keep-alive the moment it is toggled.
+            case KeepAliveAudioService.PREFERENCE_KEY -> {
+                KeepAliveAudioService.apply(requireContext().getApplicationContext());
             }
         }
         if (Arrays.asList(AppSettings.USE_TOR, AppSettings.SHOW_CONNECTION_OPTIONS).contains(key)) {

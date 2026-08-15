@@ -2787,6 +2787,12 @@ public class XmppConnectionService extends Service {
 
     @Override
     public void onDestroy() {
+        // FORK EDIT D: never leave the silent player running without a connection service.
+        try {
+            stopService(new Intent(this, KeepAliveAudioService.class));
+        } catch (final RuntimeException e) {
+            // ignored
+        }
         try {
             unregisterReceiver(this.mInternalEventReceiver);
             unregisterReceiver(this.mInternalRestrictedEventReceiver);
@@ -2826,6 +2832,8 @@ public class XmppConnectionService extends Service {
 
     public void toggleForegroundService() {
         toggleForegroundService(false, false);
+        // FORK EDIT D: keep the silent-audio keep-alive in sync with its preference.
+        KeepAliveAudioService.apply(this);
     }
 
     public void setOngoingCall(
@@ -3021,7 +3029,17 @@ public class XmppConnectionService extends Service {
             final PendingIntent pendingIntent =
                     PendingIntent.getBroadcast(
                             this, requestCode, intent, PendingIntent.FLAG_IMMUTABLE);
-            alarmManager.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, timeToWake, pendingIntent);
+            // FORK EDIT A: a plain set() is deferred by Doze to the next maintenance window,
+            // which is why background messages surfaced only every few minutes. Ask for an
+            // idle-exempt alarm instead, falling back gracefully if the OS refuses.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                    && alarmManager.canScheduleExactAlarms()) {
+                alarmManager.setExactAndAllowWhileIdle(
+                        AlarmManager.ELAPSED_REALTIME_WAKEUP, timeToWake, pendingIntent);
+            } else {
+                alarmManager.setAndAllowWhileIdle(
+                        AlarmManager.ELAPSED_REALTIME_WAKEUP, timeToWake, pendingIntent);
+            }
         } catch (final RuntimeException e) {
             Log.e(Config.LOGTAG, "unable to schedule alarm for ping", e);
         }

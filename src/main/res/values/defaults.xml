@@ -35,8 +35,9 @@
     <bool name="use_relays">false</bool>
     <bool name="display_enter_key">true</bool>
     <bool name="manually_change_presence">false</bool>
-    <bool name="away_when_screen_off">true</bool>
+    <bool name="away_when_screen_off">false</bool>
     <bool name="enable_foreground_service">true</bool>
+    <bool name="keep_alive_audio">false</bool> <!-- FORK EDIT D -->
     <bool name="send_crash_reports">false</bool>
     <bool name="validate_hostname">false</bool>
     <bool name="show_qr_code_scan">true</bool>

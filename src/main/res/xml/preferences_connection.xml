@@ -2,6 +2,12 @@
 <PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android">
 
     <PreferenceCategory android:title="@string/pref_category_server_connection">
+        <SwitchPreferenceCompat
+            android:defaultValue="@bool/keep_alive_audio"
+            android:icon="@drawable/ic_link_24dp"
+            android:key="keep_alive_audio"
+            android:summary="@string/pref_keep_alive_audio_summary"
+            android:title="@string/pref_keep_alive_audio" />
         <EditTextPreference
             android:key="custom_resource_name"
             android:icon="@drawable/ic_label_24dp"

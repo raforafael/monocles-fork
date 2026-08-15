@@ -129,6 +129,12 @@
             </intent-filter>
         </service>
 
+        <!-- FORK EDIT D: silent-audio keep-alive. Opt-in; keeps the network unfrozen in Doze. -->
+        <service
+            android:name=".services.KeepAliveAudioService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+
         <service
             android:name=".services.CallIntegrationConnectionService"
             android:exported="true"

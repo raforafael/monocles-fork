@@ -1862,4 +1862,12 @@
     <string name="audio_video_calls"><![CDATA[Audio & Video calls]]></string>
     <string name="pref_low_quality_opus">Use low quality calls down to 6–16 kb</string>
     <string name="pref_low_quality_opus_summary">Limit Opus voice calls to 6–16 kbps for unstable or very slow connections.</string>
+
+    <!-- FORK EDIT D: silent-audio keep-alive -->
+    <string name="pref_keep_alive_audio">Instant message delivery</string>
+    <string name="pref_keep_alive_audio_summary">Plays a silent sound so Android never freezes the connection. Messages arrive instantly instead of every few minutes. Uses noticeably more battery.</string>
+    <string name="keep_alive_audio_notification_title">Connection kept awake</string>
+    <string name="keep_alive_audio_notification_text">Messages will arrive instantly</string>
+    <string name="keep_alive_audio_channel_name">Instant delivery</string>
+    <string name="keep_alive_audio_channel_description">Silent playback that prevents Android from suspending the connection</string>
 </resources>
