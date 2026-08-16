@@ -528,6 +528,14 @@ public class XmppConnection implements Runnable {
                         }
 
                         localSocket = new Socket();
+                        // FORK EDIT E: disable Nagle's algorithm. XMPP is small-packet
+                        // traffic; Nagle buffers those waiting to coalesce them, adding
+                        // up to ~200ms of stall to every stanza for no benefit.
+                        try {
+                            localSocket.setTcpNoDelay(true);
+                        } catch (final java.net.SocketException e) {
+                            // ignored; not fatal
+                        }
                         localSocket.connect(addr, Config.SOCKET_TIMEOUT * 1000);
                         localSocket.setSoTimeout(Config.SOCKET_TIMEOUT * 1000);
                         if (features.encryptionEnabled) {
@@ -2983,6 +2991,14 @@ public class XmppConnection implements Runnable {
     }
 
     public void sendInactive() {
+        // FORK EDIT E: csi//inactive asks the server to *deliberately delay* traffic
+        // (prosody mod_csi_simple "delays unimportant data for as long as possible").
+        // When the keep-alive is on we are paying battery to stay awake already, so
+        // throttling ourselves server-side is counterproductive: stay 'active'.
+        if (eu.siacs.conversations.services.KeepAliveAudioService.isEnabled(
+                this.mXmppConnectionService)) {
+            return;
+        }
         this.sendPacket(new Inactive());
     }
 
