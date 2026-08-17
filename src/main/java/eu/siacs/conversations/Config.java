@@ -74,7 +74,9 @@ public final class Config {
 
     public static final boolean DISABLE_BAN = false; // disables the ability to ban users from rooms
 
-    public static final int PING_MAX_INTERVAL = 120; // FORK EDIT B: was 300
+    public static final int PING_MAX_INTERVAL = 30; // FORK EDIT F (DIAGNOSTIC): was 120. If
+    // latency drops to ~15s average, the socket is being frozen by HyperOS and delivery is
+    // poll-driven, not push-driven. Revert to 120 after the test - 30 costs real battery.
     public static final int IDLE_PING_INTERVAL = 540; // FORK EDIT B: was 600; 540 is the documented minimum
     public static final int PING_MIN_INTERVAL = 30;
     public static final int LOW_PING_TIMEOUT = 1; // used after push received
