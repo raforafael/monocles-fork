@@ -18,6 +18,7 @@ import androidx.viewpager2.adapter.FragmentStateAdapter;
 import com.google.android.material.dialog.MaterialAlertDialogBuilder;
 import com.google.android.material.tabs.TabLayoutMediator;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -27,6 +28,8 @@ import eu.siacs.conversations.databinding.ActivityMediaBrowserBinding;
 import eu.siacs.conversations.entities.Account;
 import eu.siacs.conversations.entities.Contact;
 import eu.siacs.conversations.entities.Conversation;
+import eu.siacs.conversations.entities.Message;
+import eu.siacs.conversations.ui.UiCallback;
 import eu.siacs.conversations.ui.adapter.MediaAdapter;
 import eu.siacs.conversations.ui.interfaces.OnMediaLoaded;
 import eu.siacs.conversations.ui.util.Attachment;
@@ -218,7 +221,8 @@ public class MediaBrowserActivity extends XmppActivity implements OnMediaLoaded 
             final var path = xmppConnectionService.getFileBackend().getOriginalPath(attachment.getUri());
             if (path == null) return;
             final var file = new java.io.File(path);
-            final var uri = eu.siacs.conversations.persistance.FileBackend.getUriForFile(this, file, file.getName());
+            // fork: use the original filename instead of the content-hash on-disk name
+            final var uri = eu.siacs.conversations.persistance.FileBackend.getUriForFile(this, file, resolveOriginalFilename(attachment, file));
             intent.setAction(Intent.ACTION_SEND);
             intent.putExtra(Intent.EXTRA_STREAM, uri);
             intent.setType(attachment.getMime());
@@ -229,7 +233,8 @@ public class MediaBrowserActivity extends XmppActivity implements OnMediaLoaded 
                 final var path = xmppConnectionService.getFileBackend().getOriginalPath(attachment.getUri());
                 if (path != null) {
                     final var file = new java.io.File(path);
-                    uris.add(eu.siacs.conversations.persistance.FileBackend.getUriForFile(this, file, file.getName()));
+                    // fork: use the original filename instead of the content-hash on-disk name
+                    uris.add(eu.siacs.conversations.persistance.FileBackend.getUriForFile(this, file, resolveOriginalFilename(attachment, file)));
                 }
             }
             intent.setAction(Intent.ACTION_SEND_MULTIPLE);
@@ -242,6 +247,28 @@ public class MediaBrowserActivity extends XmppActivity implements OnMediaLoaded 
         } catch (ActivityNotFoundException e) {
             Toast.makeText(this, R.string.no_application_found_to_open_file, Toast.LENGTH_SHORT).show();
         }
+    }
+
+    /** Fork: find the Message behind an attachment (for message-based filename/save paths). */
+    private Message messageFor(Attachment attachment) {
+        if (attachment == null || attachment.getUuid() == null) return null;
+        final Conversation conversation =
+                xmppConnectionService.findConversationByUuid(attachment.getConversationUuid());
+        if (conversation == null) return null;
+        return xmppConnectionService.databaseBackend.getMessage(
+                conversation, attachment.getUuid().toString());
+    }
+
+    /** Fork: resolve the ORIGINAL filename for an attachment from its message
+     * (fileParams.name recovered from the upload URL), falling back to the on-disk name. */
+    private String resolveOriginalFilename(Attachment attachment, File file) {
+        final Message message = messageFor(attachment);
+        if (message != null
+                && message.getFileParams() != null
+                && message.getFileParams().getName() != null) {
+            return message.getFileParams().getName();
+        }
+        return file.getName();
     }
 
     private void jumpToSelectedMessage() {
@@ -257,6 +284,28 @@ public class MediaBrowserActivity extends XmppActivity implements OnMediaLoaded 
     private void saveSelectedMedia() {
         int count = selectedAttachments.size();
         for (Attachment attachment : selectedAttachments) {
+            // fork: prefer the message-based path so the ORIGINAL filename is used; the
+            // plain File fallback would use the content-hash on-disk name.
+            final Message message = messageFor(attachment);
+            if (message != null) {
+                xmppConnectionService.copyAttachmentToDownloadsFolder(message, new UiCallback<Integer>() {
+                    @Override
+                    public void success(Integer object) {
+                        // ignore
+                    }
+
+                    @Override
+                    public void error(int errorCode, Integer object) {
+                        runOnUiThread(() -> Toast.makeText(MediaBrowserActivity.this, object, Toast.LENGTH_SHORT).show());
+                    }
+
+                    @Override
+                    public void userInputRequired(PendingIntent pi, Integer object) {
+                        // ignore
+                    }
+                });
+                continue;
+            }
             final var path = xmppConnectionService.getFileBackend().getOriginalPath(attachment.getUri());
             if (path != null) {
                 final var file = new java.io.File(path);

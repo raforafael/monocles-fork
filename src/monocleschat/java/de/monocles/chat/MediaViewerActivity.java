@@ -61,6 +61,7 @@ import eu.siacs.conversations.R;
 import eu.siacs.conversations.databinding.ActivityMediaViewerBinding;
 import eu.siacs.conversations.databinding.ItemMediaViewerBinding;
 import eu.siacs.conversations.entities.Conversation;
+import eu.siacs.conversations.entities.Message;
 import eu.siacs.conversations.persistance.FileBackend;
 import eu.siacs.conversations.ui.MediaBrowserActivity;
 import eu.siacs.conversations.ui.UiCallback;
@@ -93,6 +94,9 @@ public class MediaViewerActivity extends XmppActivity implements OnMediaLoaded, 
     private final List<Attachment> attachments = new ArrayList<>();
     private String initialMessageUuid;
     private Uri currentMediaUri;
+    // fork: the attachment currently shown, so "save to downloads" can resolve the original
+    // filename from its message instead of the content-hash on-disk name.
+    private Attachment mCurrentAttachment;
 
     public static String getMimeType(String path) {
         try {
@@ -216,12 +220,34 @@ public class MediaViewerActivity extends XmppActivity implements OnMediaLoaded, 
     private void share() {
         Intent share = new Intent(Intent.ACTION_SEND);
         share.setType(getMimeType(mFile.toString()));
-        share.putExtra(Intent.EXTRA_STREAM, FileBackend.getUriForFile(this, mFile, mFile.getName()));
+        // fork: use the original filename instead of the content-hash on-disk name
+        share.putExtra(Intent.EXTRA_STREAM, FileBackend.getUriForFile(this, mFile, resolveOriginalFilename(mFile)));
         try {
             startActivity(Intent.createChooser(share, getText(R.string.share_with)));
         } catch (ActivityNotFoundException e) {
             ToastCompat.makeText(this, R.string.no_application_found_to_open_file, ToastCompat.LENGTH_SHORT).show();
         }
+    }
+
+    /** Fork: resolve the ORIGINAL filename for the current attachment from its message
+     * (fileParams.name recovered from the upload URL), falling back to the on-disk name. */
+    private String resolveOriginalFilename(File file) {
+        final Attachment attachment = mCurrentAttachment;
+        if (attachment != null && attachment.getUuid() != null) {
+            final Conversation conversation =
+                    xmppConnectionService.findConversationByUuid(attachment.getConversationUuid());
+            final Message message =
+                    conversation == null
+                            ? null
+                            : xmppConnectionService.databaseBackend.getMessage(
+                                    conversation, attachment.getUuid().toString());
+            if (message != null
+                    && message.getFileParams() != null
+                    && message.getFileParams().getName() != null) {
+                return message.getFileParams().getName();
+            }
+        }
+        return file.getName();
     }
 
     private void deleteFile() {
@@ -240,7 +266,8 @@ public class MediaViewerActivity extends XmppActivity implements OnMediaLoaded, 
     private void open() {
         Uri uri;
         try {
-            uri = FileBackend.getUriForFile(this, mFile, mFile.getName());
+            // fork: use the original filename instead of the content-hash on-disk name
+            uri = FileBackend.getUriForFile(this, mFile, resolveOriginalFilename(mFile));
         } catch (SecurityException e) {
             Log.d(Config.LOGTAG, "No permission to access " + mFile.getAbsolutePath(), e);
             ToastCompat.makeText(this, this.getString(R.string.no_permission_to_access_x, mFile.getAbsolutePath()), ToastCompat.LENGTH_SHORT).show();
@@ -271,21 +298,40 @@ public class MediaViewerActivity extends XmppActivity implements OnMediaLoaded, 
     }
 
     private void saveToDownloads(File file) {
-        this.xmppConnectionService.copyAttachmentToDownloadsFolder(file, new UiCallback<>() {
-            @Override
-            public void success(Integer object) {
-                runOnUiThread(() -> Toast.makeText(MediaViewerActivity.this, getString(R.string.save_to_downloads_success), Toast.LENGTH_LONG).show());
-            }
+        final UiCallback<Integer> callback =
+                new UiCallback<>() {
+                    @Override
+                    public void success(Integer object) {
+                        runOnUiThread(() -> Toast.makeText(MediaViewerActivity.this, getString(R.string.save_to_downloads_success), Toast.LENGTH_LONG).show());
+                    }
 
-            @Override
-            public void error(int errorCode, Integer object) {
-                runOnUiThread(() -> Toast.makeText(MediaViewerActivity.this, getString(object), Toast.LENGTH_LONG).show());
-            }
+                    @Override
+                    public void error(int errorCode, Integer object) {
+                        runOnUiThread(() -> Toast.makeText(MediaViewerActivity.this, getString(object), Toast.LENGTH_LONG).show());
+                    }
 
-            @Override
-            public void userInputRequired(PendingIntent pi, Integer object) {
+                    @Override
+                    public void userInputRequired(PendingIntent pi, Integer object) {
+                    }
+                };
+        // fork: prefer the message-based path so the ORIGINAL filename is used (the message
+        // carries fileParams.name recovered from the upload URL). The plain File fallback
+        // would use the content-hash on-disk name (e.g. zb2...jpg).
+        final Attachment attachment = mCurrentAttachment;
+        if (attachment != null && attachment.getUuid() != null) {
+            final Conversation conversation =
+                    xmppConnectionService.findConversationByUuid(attachment.getConversationUuid());
+            final Message message =
+                    conversation == null
+                            ? null
+                            : xmppConnectionService.databaseBackend.getMessage(
+                                    conversation, attachment.getUuid().toString());
+            if (message != null) {
+                this.xmppConnectionService.copyAttachmentToDownloadsFolder(message, callback);
+                return;
             }
-        });
+        }
+        this.xmppConnectionService.copyAttachmentToDownloadsFolder(file, callback);
     }
 
     @OptIn(markerClass = UnstableApi.class)
@@ -670,6 +716,7 @@ public class MediaViewerActivity extends XmppActivity implements OnMediaLoaded, 
 
     private void onMediaItemSelected(Attachment attachment) {
         mFile = new File(attachment.getUri().getPath());
+        mCurrentAttachment = attachment;
         if (player == null) return;
 
         final boolean sameMedia = attachment.getUri().equals(currentMediaUri);
